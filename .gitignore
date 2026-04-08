@@ -1,0 +1,23 @@
+# Python virtual environments
+**/.venv/
+echo # secrets > .gitignore
+echo **/.env >> .gitignore
+echo **/.env.local >> .gitignore
+echo **/.env.*.local >> .gitignore
+echo. >> .gitignore
+echo # junk >> .gitignore
+echo **/.DS_Store >> .gitignore
+echo **/__pycache__/ >> .gitignore
+echo **/*.pyc >> .gitignore
+echo **/.venv/ >> .gitignore
+echo. >> .gitignore
+echo # large local media >> .gitignore
+echo FinalExamples/*.mp4 >> .gitignore
+echo FinalExamples/*.mov >> .gitignore
+# Environment files with secrets
+**/.env
+**/.env.local
+**/.env.*.local
+
+# Logs
+*.log
