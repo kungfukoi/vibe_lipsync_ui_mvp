@@ -60,8 +60,26 @@ HERE = Path(__file__).resolve().parent
 ROOT_DIR = HERE.parent  # /.../lipsync_ui_mvp
 # Load backend/.env into the process environment (best-effort)
 _load_env_file(HERE / ".env")
-PROJECTS_DIR = HERE / "projects"
-PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _resolve_projects_dir() -> Path:
+    """Resolve where runtime-generated project files should be stored.
+
+    Vercel serverless functions have a read-only filesystem except for /tmp.
+    """
+    configured = (os.getenv("PROJECTS_DIR") or "").strip()
+    if configured:
+        path = Path(configured).expanduser()
+    elif os.getenv("VERCEL") == "1":
+        path = Path("/tmp") / "lipsync_projects"
+    else:
+        path = HERE / "projects"
+
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+PROJECTS_DIR = _resolve_projects_dir()
 
 # --- Fabric pipeline script (kept inside this repo) ---
 # We resolve the generator script from within the lipsync_ui_mvp folder so the project is portable.
@@ -1063,15 +1081,23 @@ def _render_ltx_project(pdir: Path, prompt: str = "") -> None:
 # --- App ---
 app = FastAPI(title="LipSync UI MVP Backend")
 
-# CORS so the Vite UI (5173) can call the backend (8000)
+# CORS so local Vite and deployed frontends can call the backend.
+_default_cors_origins = [
+    "http://127.0.0.1:5173",
+    "http://localhost:5173",
+    "http://127.0.0.1:4173",
+    "http://localhost:4173",
+]
+_extra_cors = [o.strip() for o in (os.getenv("CORS_ALLOW_ORIGINS") or "").split(",") if o.strip()]
+_cors_origins = list(dict.fromkeys(_default_cors_origins + _extra_cors))
+_cors_origin_regex = (os.getenv("CORS_ALLOW_ORIGIN_REGEX") or "").strip() or None
+if not _cors_origin_regex and os.getenv("VERCEL") == "1":
+    _cors_origin_regex = r"https://.*\.vercel\.app"
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://127.0.0.1:5173",
-        "http://localhost:5173",
-        "http://127.0.0.1:4173",
-        "http://localhost:4173",
-    ],
+    allow_origins=_cors_origins,
+    allow_origin_regex=_cors_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
