@@ -1,3 +1,8 @@
-# Root file for hosts that run `pip install -r requirements.txt` from repo root (e.g. Render native Python).
-# Docker builds use backend/requirements.txt directly.
--r backend/requirements.txt
+# Canonical Python deps (Render native, Docker, and docs). Keep backend/requirements.txt in sync (it -r's this file).
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+python-multipart>=0.0.9
+pillow>=10.0.0
+fal-client>=0.8.0

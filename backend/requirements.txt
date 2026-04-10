@@ -1,9 +1,2 @@
-fastapi>=0.115.0
-uvicorn[standard]>=0.30.0
-requests>=2.31.0
-python-dotenv>=1.0.0
-python-multipart>=0.0.9
-
-# tools/did_test/generate_lines_fabric.py (spawned by backend with sys.executable)
-pillow>=10.0.0
-fal-client>=0.8.0
+# Re-export root deps (pip resolves paths relative to this file's directory).
+-r ../requirements.txt
