@@ -1,8 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { apiFetch, LS_ELEVEN, LS_FAL } from "./api";
 
-// Allow override via Vite env var: VITE_API_URL (set in Vercel to your Render API URL)
-const API = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
+// Set on Vercel: VITE_API_URL=https://your-service.onrender.com (no trailing slash, use https)
+const API_RAW = import.meta.env.VITE_API_URL;
+const API =
+  (typeof API_RAW === "string" && API_RAW.trim() !== "" ? API_RAW.trim().replace(/\/$/, "") : null) ||
+  "http://127.0.0.1:8000";
+const PROD_MISSING_API_URL = import.meta.env.PROD && !API_RAW;
 
 function ShotBox({ label, hint, file, setFile, aspect = "16:9", warn, badge }) {
   const [thumbUrl, setThumbUrl] = useState("");
@@ -1287,11 +1291,33 @@ export default function App() {
 
       </div>
 
+      {PROD_MISSING_API_URL ? (
+        <div
+          style={{
+            marginTop: 14,
+            padding: 14,
+            borderRadius: 10,
+            background: "rgba(255, 180, 60, 0.12)",
+            border: "1px solid rgba(255, 200, 100, 0.35)",
+            fontSize: 13,
+            lineHeight: 1.5,
+          }}
+        >
+          <strong>Production build has no API URL.</strong> In Vercel → Settings → Environment Variables, add{" "}
+          <code style={{ opacity: 0.95 }}>VITE_API_URL</code> = your Render URL (https, no trailing slash), then{" "}
+          <strong>Redeploy</strong>. Until then this app calls <code>http://127.0.0.1:8000</code>, which only works
+          on your own machine.
+        </div>
+      ) : null}
+
       <div style={{ marginTop: 10, display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
         <div style={{ opacity: 0.8, fontSize: 13 }}>
           Backend: {apiOk === null ? "checking..." : apiOk ? "connected" : "not reachable"}
           {apiHint ? ` (${apiHint})` : ""}
         </div>
+      </div>
+      <div style={{ marginTop: 6, fontSize: 11, opacity: 0.55, fontFamily: "ui-monospace, monospace" }}>
+        API base (from build): {API}
       </div>
 
       {voicesStatus && <div style={{ marginTop: 8, opacity: 0.75, fontSize: 13 }}>{voicesStatus}</div>}

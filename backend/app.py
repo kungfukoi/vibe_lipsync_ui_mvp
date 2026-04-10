@@ -104,6 +104,14 @@ class BYOKMiddleware(BaseHTTPMiddleware):
             _fal_key_ctx.reset(tok_f)
 
 
+def _normalize_cors_origin(o: str) -> str:
+    """Strip whitespace and trailing slash (browsers send Origin without trailing /)."""
+    x = (o or "").strip()
+    if len(x) > 1 and x.endswith("/"):
+        x = x[:-1]
+    return x
+
+
 def _cors_allow_origins() -> List[str]:
     out = [
         "http://127.0.0.1:5173",
@@ -114,7 +122,7 @@ def _cors_allow_origins() -> List[str]:
     extra = os.getenv("CORS_ORIGINS", "").strip()
     if extra:
         for x in extra.split(","):
-            x = x.strip()
+            x = _normalize_cors_origin(x)
             if x and x not in out:
                 out.append(x)
     return out

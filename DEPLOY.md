@@ -24,6 +24,13 @@
 
 6. Smoke test: open `https://YOUR-SERVICE.onrender.com/api/health` in a browser.
 
+### Render: use Docker if you can
+
+If error paths look like `/opt/render/project/src/tools/...`, you are on **native Python**, not Docker. Native builds only install what `pip` sees—often just a root `requirements.txt`. This repo now has a **root** `requirements.txt` that pulls in `backend/requirements.txt` (including **Pillow** and **fal-client**).
+
+- **Recommended:** **Web Service → Docker** with this repo’s `Dockerfile` (includes **ffmpeg** and all Python deps).
+- **Native Python:** Set **Build Command** to `pip install -r requirements.txt` (repo root), **Start Command** to run uvicorn from `backend`, then **Clear build cache & deploy**.
+
 ## 2) Vercel (frontend)
 
 1. **New Project** → import the same repo.

@@ -1,0 +1,3 @@
+# Root file for hosts that run `pip install -r requirements.txt` from repo root (e.g. Render native Python).
+# Docker builds use backend/requirements.txt directly.
+-r backend/requirements.txt
