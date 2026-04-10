@@ -1,0 +1,20 @@
+# https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: vibe-lipsync-api
+    runtime: docker
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    envVars:
+      - key: CORS_ORIGIN_REGEX
+        value: "https://.*\\.vercel\\.app"
+      # Add your production UI origin(s) here (comma-separated), e.g. https://my-app.vercel.app
+      - key: CORS_ORIGINS
+        sync: false
+      # Optional: server-side keys for your own testing (BYOK users send headers instead)
+      - key: ELEVEN_API_KEY
+        sync: false
+      - key: FAL_KEY
+        sync: false

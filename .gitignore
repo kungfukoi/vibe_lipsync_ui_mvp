@@ -21,3 +21,12 @@ echo FinalExamples/*.mov >> .gitignore
 
 # Logs
 *.log
+
+# Root npm (concurrently / dev orchestration)
+/node_modules
+
+# Python / local project data (fixes broken literal "echo ..." lines above)
+__pycache__/
+**/__pycache__/
+*.py[cod]
+backend/projects/

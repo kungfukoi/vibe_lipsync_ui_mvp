@@ -1,4 +1,6 @@
+import contextvars
 import os
+import sys
 import json
 import base64
 import shutil
@@ -53,6 +55,70 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
+
+# --- BYOK: per-request API keys via headers (overrides server env) ---
+_eleven_api_key_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "eleven_api_key", default=None
+)
+_fal_key_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("fal_key", default=None)
+
+_ELEVEN_KEY_MISSING = (
+    "Missing ElevenLabs API key. Set ELEVEN_API_KEY on the server or send the X-Eleven-Api-Key header (BYOK)."
+)
+_FAL_KEY_MISSING = (
+    "Missing FAL key. Set FAL_KEY on the server or send the X-Fal-Key header (BYOK)."
+)
+
+
+def _resolve_eleven_api_key() -> str:
+    v = _eleven_api_key_ctx.get()
+    if v and str(v).strip():
+        return str(v).strip()
+    return (os.getenv("ELEVEN_API_KEY") or os.getenv("XI_API_KEY") or "").strip()
+
+
+def _resolve_fal_key() -> str:
+    v = _fal_key_ctx.get()
+    if v and str(v).strip():
+        return str(v).strip()
+    return (os.getenv("FAL_KEY") or os.getenv("FAL_API_KEY") or "").strip()
+
+
+class BYOKMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):  # type: ignore[no-untyped-def]
+        raw_e = request.headers.get("x-eleven-api-key") or request.headers.get("xi-api-key")
+        raw_f = request.headers.get("x-fal-key")
+        e = raw_e.strip() if raw_e else None
+        f = raw_f.strip() if raw_f else None
+        if e == "":
+            e = None
+        if f == "":
+            f = None
+        tok_e = _eleven_api_key_ctx.set(e)
+        tok_f = _fal_key_ctx.set(f)
+        try:
+            return await call_next(request)
+        finally:
+            _eleven_api_key_ctx.reset(tok_e)
+            _fal_key_ctx.reset(tok_f)
+
+
+def _cors_allow_origins() -> List[str]:
+    out = [
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+        "http://127.0.0.1:4173",
+        "http://localhost:4173",
+    ]
+    extra = os.getenv("CORS_ORIGINS", "").strip()
+    if extra:
+        for x in extra.split(","):
+            x = x.strip()
+            if x and x not in out:
+                out.append(x)
+    return out
+
 
 # --- Paths ---
 HERE = Path(__file__).resolve().parent
@@ -174,10 +240,47 @@ def _write_lines_json(project_dir: Path, lines: List[Dict[str, Any]]) -> Path:
     return p
 
 
-def _which(cmd: str) -> Optional[str]:
+_FFMPEG_MISSING = (
+    "ffmpeg not found. Install ffmpeg and add it to PATH, or set FFMPEG_PATH to the full path of ffmpeg.exe. "
+    "Windows (winget): winget install --id Gyan.FFmpeg"
+)
+
+
+def _resolve_ffmpeg() -> Optional[str]:
+    """Resolve ffmpeg: FFMPEG_PATH / IMAGEIO_FFMPEG_EXE, then PATH."""
     from shutil import which
 
-    return which(cmd)
+    for key in ("FFMPEG_PATH", "IMAGEIO_FFMPEG_EXE"):
+        raw = os.environ.get(key)
+        if not raw:
+            continue
+        p = Path(raw)
+        if p.is_file():
+            return str(p)
+        w = which(raw)
+        if w:
+            return w
+    return which("ffmpeg")
+
+
+def _resolve_ffprobe() -> Optional[str]:
+    """Resolve ffprobe: FFPROBE_PATH, sibling of ffmpeg, then PATH."""
+    from shutil import which
+
+    raw = os.environ.get("FFPROBE_PATH")
+    if raw:
+        p = Path(raw)
+        if p.is_file():
+            return str(p)
+        w = which(raw)
+        if w:
+            return w
+    ff = _resolve_ffmpeg()
+    if ff:
+        sibling = Path(ff).parent / ("ffprobe.exe" if os.name == "nt" else "ffprobe")
+        if sibling.is_file():
+            return str(sibling)
+    return which("ffprobe")
 
 
 
@@ -216,9 +319,9 @@ def _eleven_tts_to_wav(
 
     We request MP3 from ElevenLabs then convert to WAV via ffmpeg.
     """
-    api_key = os.getenv("ELEVEN_API_KEY") or os.getenv("XI_API_KEY")
+    api_key = _resolve_eleven_api_key()
     if not api_key:
-        raise HTTPException(status_code=500, detail="ELEVEN_API_KEY not loaded in backend/.env")
+        raise HTTPException(status_code=500, detail=_ELEVEN_KEY_MISSING)
 
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
     headers = {
@@ -282,9 +385,9 @@ def _eleven_tts_to_wav(
     mp3_path = wav_path.with_suffix(".mp3")
     mp3_path.write_bytes(r.content)
 
-    ffmpeg = _which("ffmpeg")
+    ffmpeg = _resolve_ffmpeg()
     if not ffmpeg:
-        raise HTTPException(status_code=500, detail="ffmpeg not found. Install ffmpeg to convert audio.")
+        raise HTTPException(status_code=500, detail=_FFMPEG_MISSING)
 
     proc = subprocess.run(
         [ffmpeg, "-y", "-i", str(mp3_path), str(wav_path)],
@@ -316,9 +419,9 @@ def _eleven_dialogue_to_wav_and_ranges(
     which includes start/end times and the `dialogue_input_index`.
     """
 
-    api_key = os.getenv("ELEVEN_API_KEY") or os.getenv("XI_API_KEY")
+    api_key = _resolve_eleven_api_key()
     if not api_key:
-        raise HTTPException(status_code=500, detail="ELEVEN_API_KEY not loaded in backend/.env")
+        raise HTTPException(status_code=500, detail=_ELEVEN_KEY_MISSING)
 
     if not inputs:
         raise HTTPException(status_code=400, detail="No dialogue inputs provided")
@@ -328,9 +431,9 @@ def _eleven_dialogue_to_wav_and_ranges(
     if len(uniq) > 10:
         raise HTTPException(status_code=400, detail="Dialogue mode supports a maximum of 10 unique voice IDs per request")
 
-    ffmpeg = _which("ffmpeg")
+    ffmpeg = _resolve_ffmpeg()
     if not ffmpeg:
-        raise HTTPException(status_code=500, detail="ffmpeg not found. Install ffmpeg to convert audio.")
+        raise HTTPException(status_code=500, detail=_FFMPEG_MISSING)
 
     url = "https://api.elevenlabs.io/v1/text-to-dialogue/with-timestamps"
     headers = {
@@ -444,9 +547,9 @@ def _convert_audio_to_wav(
     - Forces 48kHz sample rate + mono for predictable downstream behavior.
     """
 
-    ffmpeg = _which("ffmpeg")
+    ffmpeg = _resolve_ffmpeg()
     if not ffmpeg:
-        raise HTTPException(status_code=500, detail="ffmpeg not found. Install ffmpeg to convert audio.")
+        raise HTTPException(status_code=500, detail=_FFMPEG_MISSING)
 
     if not in_audio_path.exists() or in_audio_path.stat().st_size == 0:
         raise HTTPException(status_code=400, detail=f"Input audio is missing or empty: {in_audio_path.name}")
@@ -489,13 +592,13 @@ def _eleven_sts_to_wav(
 
     Saves a WAV at `wav_path`.
     """
-    api_key = os.getenv("ELEVEN_API_KEY") or os.getenv("XI_API_KEY")
+    api_key = _resolve_eleven_api_key()
     if not api_key:
-        raise HTTPException(status_code=500, detail="ELEVEN_API_KEY not loaded in backend/.env")
+        raise HTTPException(status_code=500, detail=_ELEVEN_KEY_MISSING)
 
-    ffmpeg = _which("ffmpeg")
+    ffmpeg = _resolve_ffmpeg()
     if not ffmpeg:
-        raise HTTPException(status_code=500, detail="ffmpeg not found. Install ffmpeg to convert audio.")
+        raise HTTPException(status_code=500, detail=_FFMPEG_MISSING)
 
     if not in_audio_path.exists() or in_audio_path.stat().st_size == 0:
         raise HTTPException(status_code=400, detail=f"Input audio is missing or empty: {in_audio_path.name}")
@@ -567,9 +670,9 @@ def _eleven_sts_to_wav(
 
 def _ensure_project_env(project_dir: Path) -> None:
     """Write a minimal .env into the project folder so legacy scripts can find FAL_KEY."""
-    fal_key = os.getenv("FAL_KEY") or os.getenv("FAL_API_KEY") or ""
+    fal_key = _resolve_fal_key()
     if not fal_key:
-        raise HTTPException(status_code=500, detail="FAL_KEY not loaded in backend/.env")
+        raise HTTPException(status_code=500, detail=_FAL_KEY_MISSING)
     (project_dir / ".env").write_text(f"FAL_KEY={fal_key}\n", encoding="utf-8")
 
 
@@ -588,13 +691,13 @@ def _stitch_preview(project_dir: Path) -> Optional[Path]:
     if out_path.exists():
         return out_path
 
-    ffmpeg = _which("ffmpeg")
+    ffmpeg = _resolve_ffmpeg()
     if not ffmpeg:
         return None
 
     def _probe_duration_seconds(path: Path) -> float:
         try:
-            ffprobe = _which("ffprobe") or "ffprobe"
+            ffprobe = _resolve_ffprobe() or "ffprobe"
             proc = subprocess.run(
                 [
                     ffprobe,
@@ -989,89 +1092,100 @@ def _render_ltx_project(pdir: Path, prompt: str = "") -> None:
     except Exception:
         pass
 
-    for item in lines:
-        idx = int(item.get("index", 0) or 0)
-        if idx <= 0:
-            continue
+    fk = _resolve_fal_key()
+    if not fk:
+        raise HTTPException(status_code=500, detail=_FAL_KEY_MISSING)
+    old_fal = os.environ.get("FAL_KEY")
+    os.environ["FAL_KEY"] = fk
+    try:
+        for item in lines:
+            idx = int(item.get("index", 0) or 0)
+            if idx <= 0:
+                continue
 
-        speaker = str(item.get("speaker", "") or "").strip().upper()
-        if speaker not in {"A", "B"}:
-            speaker = "A"
+            speaker = str(item.get("speaker", "") or "").strip().upper()
+            if speaker not in {"A", "B"}:
+                speaker = "A"
 
-        tag = str(item.get("visual", "") or "").strip().upper() or fallback_tag
-        img_name = vmap.get(tag) or vmap.get(fallback_tag)
-        if not img_name:
-            raise HTTPException(status_code=400, detail=f"No visual image found for tag '{tag}'")
+            tag = str(item.get("visual", "") or "").strip().upper() or fallback_tag
+            img_name = vmap.get(tag) or vmap.get(fallback_tag)
+            if not img_name:
+                raise HTTPException(status_code=400, detail=f"No visual image found for tag '{tag}'")
 
-        image_path = pdir / str(img_name)
-        audio_path = pdir / f"line_{idx:03d}.wav"
-        out_mp4 = pdir / f"line_{idx:03d}_{speaker}.mp4"
+            image_path = pdir / str(img_name)
+            audio_path = pdir / f"line_{idx:03d}.wav"
+            out_mp4 = pdir / f"line_{idx:03d}_{speaker}.mp4"
 
-        if not image_path.exists():
-            raise HTTPException(status_code=400, detail=f"Missing visual file: {img_name}")
-        if not audio_path.exists():
-            raise HTTPException(status_code=400, detail=f"Missing audio file: {audio_path.name}")
+            if not image_path.exists():
+                raise HTTPException(status_code=400, detail=f"Missing visual file: {img_name}")
+            if not audio_path.exists():
+                raise HTTPException(status_code=400, detail=f"Missing audio file: {audio_path.name}")
 
-        # Upload media to fal storage
-        image_url = fal_client.upload_file(str(image_path))
-        audio_url = fal_client.upload_file(str(audio_path))
+            # Upload media to fal storage
+            image_url = fal_client.upload_file(str(image_path))
+            audio_url = fal_client.upload_file(str(audio_path))
 
-        # Submit job and wait for result (fine for short per-line clips)
-        result = fal_client.subscribe(
-            endpoint,
-            arguments={
-                "prompt": final_prompt,
-                "negative_prompt": (
-                    "camera shake, handheld, dolly, zoom, pan, tilt, orbit, drifting frame, "
-                    "background animation, moving walls, moving objects, warping background, flicker, "
-                    "style change, cartoon, CGI, exaggerated motion, jitter, unstable framing"
-                ),
-                "audio_url": audio_url,
-                "image_url": image_url,
-                "video_size": "auto",
-                "match_audio_length": True,
-                "camera_lora": "static",
-                "camera_lora_scale": 1.0,
-                "fps": 25,
-                "video_output_type": "X264 (.mp4)",
-                "video_quality": "high",
-                "use_multiscale": False,
-                "guidance_scale": 4.0,
-                "num_inference_steps": 45,
-                "enable_prompt_expansion": False,
-                "preprocess_audio": True,
-                "image_strength": 1.0,
-                "audio_strength": 1.0,
-                # No LoRAs by default.
-                "loras": [],
-            },
-        )
+            # Submit job and wait for result (fine for short per-line clips)
+            result = fal_client.subscribe(
+                endpoint,
+                arguments={
+                    "prompt": final_prompt,
+                    "negative_prompt": (
+                        "camera shake, handheld, dolly, zoom, pan, tilt, orbit, drifting frame, "
+                        "background animation, moving walls, moving objects, warping background, flicker, "
+                        "style change, cartoon, CGI, exaggerated motion, jitter, unstable framing"
+                    ),
+                    "audio_url": audio_url,
+                    "image_url": image_url,
+                    "video_size": "auto",
+                    "match_audio_length": True,
+                    "camera_lora": "static",
+                    "camera_lora_scale": 1.0,
+                    "fps": 25,
+                    "video_output_type": "X264 (.mp4)",
+                    "video_quality": "high",
+                    "use_multiscale": False,
+                    "guidance_scale": 4.0,
+                    "num_inference_steps": 45,
+                    "enable_prompt_expansion": False,
+                    "preprocess_audio": True,
+                    "image_strength": 1.0,
+                    "audio_strength": 1.0,
+                    # No LoRAs by default.
+                    "loras": [],
+                },
+            )
 
-        video_url = None
-        if isinstance(result, dict):
-            video_url = (result.get("video") or {}).get("url")
+            video_url = None
+            if isinstance(result, dict):
+                video_url = (result.get("video") or {}).get("url")
 
-        if not video_url:
-            raise HTTPException(status_code=500, detail=f"LTX returned no video url for line {idx}")
+            if not video_url:
+                raise HTTPException(status_code=500, detail=f"LTX returned no video url for line {idx}")
 
-        r = requests.get(video_url, timeout=300)
-        if r.status_code != 200 or not r.content:
-            raise HTTPException(status_code=500, detail=f"Failed to download LTX video for line {idx}")
+            r = requests.get(video_url, timeout=300)
+            if r.status_code != 200 or not r.content:
+                raise HTTPException(status_code=500, detail=f"Failed to download LTX video for line {idx}")
 
-        out_mp4.write_bytes(r.content)
+            out_mp4.write_bytes(r.content)
+    finally:
+        if old_fal is None:
+            os.environ.pop("FAL_KEY", None)
+        else:
+            os.environ["FAL_KEY"] = old_fal
+
 
 # --- App ---
 app = FastAPI(title="LipSync UI MVP Backend")
 
-# CORS so the Vite UI (5173) can call the backend (8000)
+_cors_regex = os.getenv("CORS_ORIGIN_REGEX", "").strip() or None
+
+# Last-added middleware runs first: CORS handles preflight, then BYOK sets request-scoped keys.
+app.add_middleware(BYOKMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://127.0.0.1:5173",
-        "http://localhost:5173",
-        "http://127.0.0.1:4173",
-        "http://localhost:4173",
-    ],
+    allow_origins=_cors_allow_origins(),
+    allow_origin_regex=_cors_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1263,12 +1377,12 @@ async def upload_masks(
 
 @app.get("/api/health")
 def health() -> Dict[str, Any]:
-    # Keep this response compatible with your earlier curl output
-    eleven_key = os.getenv("ELEVEN_API_KEY") or os.getenv("XI_API_KEY") or ""
+    e = _resolve_eleven_api_key()
+    f = _resolve_fal_key()
     return {
         "ok": True,
-        "ELEVEN_API_KEY_loaded": bool(eleven_key),
-        "FAL_KEY_loaded": bool(os.getenv("FAL_KEY") or os.getenv("FAL_API_KEY")),
+        "ELEVEN_API_KEY_loaded": bool(e),
+        "FAL_KEY_loaded": bool(f),
     }
 
 
@@ -1282,7 +1396,7 @@ def voices() -> Dict[str, Any]:
 
     cache_path = HERE / "voices_cache.json"
 
-    api_key = os.getenv("ELEVEN_API_KEY") or os.getenv("XI_API_KEY")
+    api_key = _resolve_eleven_api_key()
     if api_key:
         try:
             r = requests.get(
@@ -1610,7 +1724,7 @@ def render(payload: Dict[str, Any]) -> JSONResponse:
             )
 
         proc = subprocess.run(
-            ["python3", str(GEN_FABRIC_PY)],
+            [sys.executable, str(GEN_FABRIC_PY)],
             cwd=str(pdir),
             capture_output=True,
             text=True,
@@ -1883,7 +1997,7 @@ def generate_audio(payload: Dict[str, Any]) -> JSONResponse:
         # Determine full WAV duration (seconds) for range repair.
         wav_duration = 0.0
         try:
-            ffprobe = _which("ffprobe") or "ffprobe"
+            ffprobe = _resolve_ffprobe() or "ffprobe"
             proc_d = subprocess.run(
                 [
                     ffprobe,
@@ -1914,9 +2028,9 @@ def generate_audio(payload: Dict[str, Any]) -> JSONResponse:
                 pass
             use_dialogue_mode = False
         else:
-            ffmpeg = _which("ffmpeg")
+            ffmpeg = _resolve_ffmpeg()
             if not ffmpeg:
-                raise HTTPException(status_code=500, detail="ffmpeg not found. Install ffmpeg to split audio.")
+                raise HTTPException(status_code=500, detail=_FFMPEG_MISSING)
 
             # Split per line using the returned per-input ranges
             # Padding can cause overlap/bleed between adjacent lines (you'll hear the next line early).

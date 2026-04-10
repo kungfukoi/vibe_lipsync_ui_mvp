@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { apiFetch, LS_ELEVEN, LS_FAL } from "./api";
 
-// Allow override via Vite env var: VITE_API_URL
+// Allow override via Vite env var: VITE_API_URL (set in Vercel to your Render API URL)
 const API = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
 
 function ShotBox({ label, hint, file, setFile, aspect = "16:9", warn, badge }) {
@@ -130,6 +131,21 @@ export default function App() {
   const [voicesStatus, setVoicesStatus] = useState("Loading voices...");
   const [apiOk, setApiOk] = useState(null); // null | true | false
   const [apiHint, setApiHint] = useState("");
+  const [byokRefresh, setByokRefresh] = useState(0);
+  const [elevenDraft, setElevenDraft] = useState(() => {
+    try {
+      return localStorage.getItem(LS_ELEVEN) || "";
+    } catch {
+      return "";
+    }
+  });
+  const [falDraft, setFalDraft] = useState(() => {
+    try {
+      return localStorage.getItem(LS_FAL) || "";
+    } catch {
+      return "";
+    }
+  });
 
   const DEFAULT_PERFORMANCE = 0.35;
   const [performance, setPerformance] = useState(DEFAULT_PERFORMANCE); // 0..1 (mapped to ElevenLabs style)
@@ -512,7 +528,7 @@ export default function App() {
 
       // 1) Quick health check (best-effort)
       try {
-        const healthRes = await fetch(`${API}/api/health`);
+        const healthRes = await apiFetch(`${API}/api/health`);
         if (healthRes.ok) {
           setApiOk(true);
         } else {
@@ -522,12 +538,12 @@ export default function App() {
         }
       } catch (e) {
         setApiOk(false);
-        setApiHint("Cannot reach backend. Is it running on port 8000?");
+        setApiHint("Cannot reach backend. Check VITE_API_URL / API URL and that the server is running.");
       }
 
       // 2) Voices fetch
       try {
-        const res = await fetch(`${API}/api/voices`);
+        const res = await apiFetch(`${API}/api/voices`);
         if (!res.ok) {
           const t = await res.text();
           setVoices([]);
@@ -544,7 +560,7 @@ export default function App() {
       }
     }
     loadVoices();
-  }, []);
+  }, [byokRefresh]);
   const toggleAudioPreview = (idx) => {
     const url = audioPreviewUrls[idx];
     if (!url) return;
@@ -672,7 +688,7 @@ export default function App() {
       if (inputMode === "script") {
         setStatus("Step 1/4: Creating project...");
 
-        const ttsRes = await fetch(`${API}/api/project_from_script`, {
+        const ttsRes = await apiFetch(`${API}/api/project_from_script`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -721,7 +737,7 @@ export default function App() {
           fdAudio.append("audios", l.file);
         });
 
-        const stsRes = await fetch(`${API}/api/sts`, {
+        const stsRes = await apiFetch(`${API}/api/sts`, {
           method: "POST",
           body: fdAudio,
         });
@@ -753,7 +769,7 @@ export default function App() {
       fd.append("cu_a", cuAFile);
       fd.append("cu_b", cuBFile);
 
-      const upRes = await fetch(`${API}/api/upload_inputs`, {
+      const upRes = await apiFetch(`${API}/api/upload_inputs`, {
         method: "POST",
         body: fd,
       });
@@ -785,7 +801,7 @@ export default function App() {
         fdV.append("voices_json", JSON.stringify(tagged.map((t) => t.voice_id)));
         tagged.forEach((t) => fdV.append("files", t.file));
 
-        const visRes = await fetch(`${API}/api/upload_visuals`, {
+        const visRes = await apiFetch(`${API}/api/upload_visuals`, {
           method: "POST",
           body: fdV,
         });
@@ -815,7 +831,7 @@ export default function App() {
           fdM.append("files", f);
         }
 
-        const maskRes = await fetch(`${API}/api/upload_masks`, {
+        const maskRes = await apiFetch(`${API}/api/upload_masks`, {
           method: "POST",
           body: fdM,
         });
@@ -830,7 +846,7 @@ export default function App() {
       // Script mode: generate audio AFTER visuals are uploaded, using visuals.json speaker mapping
       if (inputMode === "script") {
         setStatus("Step 3/4: Generating audio...");
-        const audioRes = await fetch(`${API}/api/generate_audio`, {
+        const audioRes = await apiFetch(`${API}/api/generate_audio`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -872,7 +888,7 @@ export default function App() {
         setStatus(`Step 3/3: Rendering ${effectiveRenderer === "ltx" ? "LTX" : "Fabric"} clips...`);
       }
 
-      const renderRes = await fetch(`${API}/api/render`, {
+      const renderRes = await apiFetch(`${API}/api/render`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -953,6 +969,106 @@ export default function App() {
       >
       <div style={{ display: "flex", alignItems: "baseline", gap: 16, flexWrap: "wrap" }}>
         <h1 style={{ fontSize: 44, letterSpacing: 1.5, margin: 0, fontWeight: 950 }}>Episode Builder</h1>
+      </div>
+
+      <div
+        style={{
+          marginTop: 20,
+          padding: 16,
+          borderRadius: 12,
+          border: "1px solid rgba(255,255,255,0.12)",
+          background: "rgba(255,255,255,0.04)",
+          maxWidth: 720,
+        }}
+      >
+        <div style={{ fontWeight: 900, fontSize: 15, marginBottom: 8 }}>Your API keys (BYOK)</div>
+        <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 12, lineHeight: 1.45 }}>
+          Keys stay in this browser (localStorage) and are sent to your backend over HTTPS only. For local dev,
+          the backend can use <code style={{ opacity: 0.9 }}>backend/.env</code> instead.
+        </div>
+        <div style={{ display: "grid", gap: 10 }}>
+          <label style={{ display: "grid", gap: 4, fontSize: 12 }}>
+            <span style={{ opacity: 0.8 }}>ElevenLabs API key</span>
+            <input
+              type="password"
+              autoComplete="off"
+              value={elevenDraft}
+              onChange={(e) => setElevenDraft(e.target.value)}
+              placeholder="xi-api-key…"
+              style={{
+                padding: 10,
+                borderRadius: 8,
+                border: "1px solid rgba(255,255,255,0.14)",
+                background: "rgba(0,0,0,0.25)",
+                color: "#eaeaea",
+              }}
+            />
+          </label>
+          <label style={{ display: "grid", gap: 4, fontSize: 12 }}>
+            <span style={{ opacity: 0.8 }}>FAL key (Fabric / LTX)</span>
+            <input
+              type="password"
+              autoComplete="off"
+              value={falDraft}
+              onChange={(e) => setFalDraft(e.target.value)}
+              placeholder="FAL_KEY…"
+              style={{
+                padding: 10,
+                borderRadius: 8,
+                border: "1px solid rgba(255,255,255,0.14)",
+                background: "rgba(0,0,0,0.25)",
+                color: "#eaeaea",
+              }}
+            />
+          </label>
+          <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+            <button
+              type="button"
+              onClick={() => {
+                try {
+                  localStorage.setItem(LS_ELEVEN, elevenDraft.trim());
+                  localStorage.setItem(LS_FAL, falDraft.trim());
+                } catch {}
+                setByokRefresh((n) => n + 1);
+              }}
+              style={{
+                padding: "8px 14px",
+                borderRadius: 10,
+                border: "1px solid rgba(255,255,255,0.18)",
+                background: "rgba(255,255,255,0.1)",
+                color: "#eaeaea",
+                cursor: "pointer",
+                fontWeight: 800,
+              }}
+            >
+              Save keys & reload voices
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                try {
+                  localStorage.removeItem(LS_ELEVEN);
+                  localStorage.removeItem(LS_FAL);
+                } catch {}
+                setElevenDraft("");
+                setFalDraft("");
+                setByokRefresh((n) => n + 1);
+              }}
+              style={{
+                padding: "8px 14px",
+                borderRadius: 10,
+                border: "1px solid rgba(255,255,255,0.12)",
+                background: "transparent",
+                color: "#eaeaea",
+                cursor: "pointer",
+                fontWeight: 700,
+                opacity: 0.85,
+              }}
+            >
+              Clear
+            </button>
+          </div>
+        </div>
       </div>
 
       <div
