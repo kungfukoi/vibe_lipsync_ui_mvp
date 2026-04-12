@@ -780,7 +780,7 @@ def _stitch_preview(project_dir: Path) -> Optional[Path]:
     ltx_mode = False
     try:
         marker = (project_dir / "_renderer.txt").read_text(encoding="utf-8").strip().lower()
-        ltx_mode = marker.startswith("ltx")
+        ltx_mode = marker.startswith("ltx") or marker.startswith("infinitalk")
     except Exception:
         ltx_mode = False
 
@@ -1176,6 +1176,169 @@ def _render_ltx_project(pdir: Path, prompt: str = "") -> None:
                 raise HTTPException(status_code=500, detail=f"Failed to download LTX video for line {idx}")
 
             out_mp4.write_bytes(r.content)
+    finally:
+        if old_fal is None:
+            os.environ.pop("FAL_KEY", None)
+        else:
+            os.environ["FAL_KEY"] = old_fal
+
+
+def _ffmpeg_ref_video_from_still_and_audio(ffmpeg: str, image_path: Path, audio_path: Path, out_mp4: Path) -> None:
+    """Build a short reference MP4 (looped still + line audio) for fal-ai/infinitalk/video-to-video."""
+    out_mp4.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-loop",
+        "1",
+        "-framerate",
+        "1",
+        "-i",
+        str(image_path),
+        "-i",
+        str(audio_path),
+        "-vf",
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        "-c:v",
+        "libx264",
+        "-tune",
+        "stillimage",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-shortest",
+        str(out_mp4),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0 or (not out_mp4.exists()) or out_mp4.stat().st_size == 0:
+        tail = ((proc.stderr or "") + "\n" + (proc.stdout or ""))[-2500:]
+        raise HTTPException(status_code=500, detail=f"ffmpeg ref video for Infinitalk failed: {tail}")
+
+
+def _render_infinitalk_project(pdir: Path, prompt: str = "") -> None:
+    """Per-line talking-head clips via fal-ai/infinitalk/video-to-video.
+
+    Infinitalk expects video_url + audio_url. We synthesize a reference video from the line's still
+    image looped over the WAV duration, upload both URLs, then download the result to line_XXX_{A|B}.mp4.
+    """
+
+    try:
+        import fal_client  # type: ignore
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail="fal-client not installed. Install in backend venv: pip install fal-client",
+        )
+
+    lines_path = pdir / "lines.json"
+    visuals_path = pdir / "visuals.json"
+    if not lines_path.exists():
+        raise HTTPException(status_code=400, detail="lines.json not found")
+    if not visuals_path.exists():
+        raise HTTPException(status_code=400, detail="visuals.json not found")
+
+    try:
+        lines = json.loads(lines_path.read_text(encoding="utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Failed to read lines.json")
+
+    try:
+        vdata = json.loads(visuals_path.read_text(encoding="utf-8"))
+        vmap = vdata.get("visuals", {}) or {}
+    except Exception:
+        vmap = {}
+
+    if not isinstance(lines, list) or not lines:
+        raise HTTPException(status_code=400, detail="lines.json is empty")
+    if not isinstance(vmap, dict) or not vmap:
+        raise HTTPException(status_code=400, detail="visuals.json has no visuals mapping")
+
+    ffmpeg = _resolve_ffmpeg()
+    if not ffmpeg:
+        raise HTTPException(status_code=500, detail=_FFMPEG_MISSING)
+
+    static_prefix = (
+        "Talking head, natural lip sync to the provided audio. Static camera, locked framing, "
+        "preserve identity and wardrobe from the reference. Subtle facial motion only. "
+    )
+    base_prompt = "Natural speech performance, clear mouth shapes, neutral background, no camera move."
+    user_prompt = (prompt or "").strip()
+    final_prompt = static_prefix + (user_prompt or base_prompt)
+
+    endpoint = "fal-ai/infinitalk/video-to-video"
+    fallback_tag = next(iter(vmap.keys()))
+
+    try:
+        (pdir / "_renderer.txt").write_text("infinitalk\n", encoding="utf-8")
+    except Exception:
+        pass
+
+    fk = _resolve_fal_key()
+    if not fk:
+        raise HTTPException(status_code=500, detail=_FAL_KEY_MISSING)
+    old_fal = os.environ.get("FAL_KEY")
+    os.environ["FAL_KEY"] = fk
+    try:
+        for item in lines:
+            idx = int(item.get("index", 0) or 0)
+            if idx <= 0:
+                continue
+
+            speaker = str(item.get("speaker", "") or "").strip().upper()
+            if speaker not in {"A", "B"}:
+                speaker = "A"
+
+            tag = str(item.get("visual", "") or "").strip().upper() or fallback_tag
+            img_name = vmap.get(tag) or vmap.get(fallback_tag)
+            if not img_name:
+                raise HTTPException(status_code=400, detail=f"No visual image found for tag '{tag}'")
+
+            image_path = pdir / str(img_name)
+            audio_path = pdir / f"line_{idx:03d}.wav"
+            out_mp4 = pdir / f"line_{idx:03d}_{speaker}.mp4"
+            ref_mp4 = pdir / f"_infinitalk_ref_{idx:03d}.mp4"
+
+            if not image_path.exists():
+                raise HTTPException(status_code=400, detail=f"Missing visual file: {img_name}")
+            if not audio_path.exists():
+                raise HTTPException(status_code=400, detail=f"Missing audio file: {audio_path.name}")
+
+            try:
+                _ffmpeg_ref_video_from_still_and_audio(ffmpeg, image_path, audio_path, ref_mp4)
+                video_url = fal_client.upload_file(str(ref_mp4))
+                audio_url = fal_client.upload_file(str(audio_path))
+
+                result = fal_client.subscribe(
+                    endpoint,
+                    arguments={
+                        "video_url": video_url,
+                        "audio_url": audio_url,
+                        "prompt": final_prompt,
+                        "num_frames": 97,
+                        "resolution": "480p",
+                        "seed": 42,
+                        "acceleration": "regular",
+                    },
+                )
+
+                out_video_url = None
+                if isinstance(result, dict):
+                    out_video_url = (result.get("video") or {}).get("url")
+
+                if not out_video_url:
+                    raise HTTPException(status_code=500, detail=f"Infinitalk returned no video url for line {idx}")
+
+                r = requests.get(out_video_url, timeout=300)
+                if r.status_code != 200 or not r.content:
+                    raise HTTPException(status_code=500, detail=f"Failed to download Infinitalk video for line {idx}")
+
+                out_mp4.write_bytes(r.content)
+            finally:
+                try:
+                    ref_mp4.unlink(missing_ok=True)
+                except Exception:
+                    pass
     finally:
         if old_fal is None:
             os.environ.pop("FAL_KEY", None)
@@ -1672,7 +1835,7 @@ async def upload_inputs(
 
 @app.post("/api/render")
 def render(payload: Dict[str, Any]) -> JSONResponse:
-    """Step 3: run the selected renderer (fabric or ltx) in the project folder and return outputs."""
+    """Step 3: run the selected renderer (fabric, ltx, or infinitalk) in the project folder and return outputs."""
 
     project_dir = payload.get("project_dir")
     if not project_dir:
@@ -1686,8 +1849,8 @@ def render(payload: Dict[str, Any]) -> JSONResponse:
     _ensure_project_env(pdir)
 
     renderer = str(payload.get("renderer", "fabric") or "fabric").strip().lower()
-    if renderer not in {"fabric", "ltx"}:
-        return JSONResponse({"error": "renderer must be 'fabric' or 'ltx'"}, status_code=400)
+    if renderer not in {"fabric", "ltx", "infinitalk"}:
+        return JSONResponse({"error": "renderer must be 'fabric', 'ltx', or 'infinitalk'"}, status_code=400)
 
     ltx_prompt = str(payload.get("ltx_prompt", "") or "")
 
@@ -1749,14 +1912,22 @@ def render(payload: Dict[str, Any]) -> JSONResponse:
                 status_code=500,
             )
 
-    else:
-        # LTX path: render per-line mp4s, then reuse the same stitching + outputs handling below
+    elif renderer == "ltx":
         try:
             _render_ltx_project(pdir, prompt=ltx_prompt)
         except HTTPException as e:
             return JSONResponse({"error": str(e.detail)}, status_code=e.status_code)
         except Exception as e:
             return JSONResponse({"error": f"LTX render failed: {e}"}, status_code=500)
+
+    else:
+        # infinitalk
+        try:
+            _render_infinitalk_project(pdir, prompt=ltx_prompt)
+        except HTTPException as e:
+            return JSONResponse({"error": str(e.detail)}, status_code=e.status_code)
+        except Exception as e:
+            return JSONResponse({"error": f"Infinitalk render failed: {e}"}, status_code=500)
 
     stitched = _stitch_preview(pdir)
     if stitched is None:

@@ -261,7 +261,7 @@ export default function App() {
   ]);
   const [showScriptImport, setShowScriptImport] = useState(false);
   const [inputMode, setInputMode] = useState("script"); // "script" | "audio"
-  const [renderer, setRenderer] = useState("fabric"); // "fabric" | "ltx"
+  const [renderer, setRenderer] = useState("fabric"); // "fabric" | "ltx" | "infinitalk"
   const [ltxPrompt, setLtxPrompt] = useState("");
   const [useNativeAudio, setUseNativeAudio] = useState(false);
   const [useDialogueMode, setUseDialogueMode] = useState(true);
@@ -687,7 +687,7 @@ export default function App() {
       setBusy(true);
       let projectDir = "";
 
-      const effectiveRenderer = inputMode === "audio" ? renderer : "fabric";
+      const effectiveRenderer = renderer;
 
       if (inputMode === "script") {
         setStatus("Step 1/4: Creating project...");
@@ -885,11 +885,21 @@ export default function App() {
             ? "Dialogue debug: (no flags returned)"
             : `Dialogue requested: ${dbgRequested} | Used: ${dbgUsed} | ${dbgUsed ? "OK" : `Fallback: ${dbgReason || "unknown"}`}`;
 
-        setStatus(
-          `Step 4/4: Rendering ${effectiveRenderer === "ltx" ? "LTX" : "Fabric"} clips...  [${dbgLine}]`
-        );
+        const rlab =
+          effectiveRenderer === "ltx"
+            ? "LTX"
+            : effectiveRenderer === "infinitalk"
+              ? "Infinitalk"
+              : "Fabric";
+        setStatus(`Step 4/4: Rendering ${rlab} clips...  [${dbgLine}]`);
       } else {
-        setStatus(`Step 3/3: Rendering ${effectiveRenderer === "ltx" ? "LTX" : "Fabric"} clips...`);
+        const rlab2 =
+          effectiveRenderer === "ltx"
+            ? "LTX"
+            : effectiveRenderer === "infinitalk"
+              ? "Infinitalk"
+              : "Fabric";
+        setStatus(`Step 3/3: Rendering ${rlab2} clips...`);
       }
 
       const renderRes = await apiFetch(`${API}/api/render`, {
@@ -898,7 +908,8 @@ export default function App() {
         body: JSON.stringify({
           project_dir: projectDir,
           renderer: effectiveRenderer,
-          ltx_prompt: effectiveRenderer === "ltx" ? ltxPrompt : "",
+          ltx_prompt:
+            effectiveRenderer === "ltx" || effectiveRenderer === "infinitalk" ? ltxPrompt : "",
         }),
       });
 
@@ -1336,7 +1347,6 @@ export default function App() {
           <button
             onClick={() => {
               setInputMode("script");
-              setRenderer("fabric");
             }}
             style={{
               padding: "8px 12px",
@@ -1365,84 +1375,110 @@ export default function App() {
         </div>
       </div>
 
-      {inputMode === "audio" && (
-        <>
-          <div style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-            <div style={{ fontWeight: 900, fontSize: 18 }}>Renderer</div>
-            <div
-              style={{
-                display: "inline-flex",
-                border: "1px solid rgba(255,255,255,0.14)",
-                borderRadius: 999,
-                overflow: "hidden",
-                background: "rgba(255,255,255,0.04)",
-              }}
-            >
-              <button
-                onClick={() => setRenderer("fabric")}
-                style={{
-                  padding: "8px 12px",
-                  border: "none",
-                  background: renderer === "fabric" ? "rgba(255,255,255,0.12)" : "transparent",
-                  color: "#eaeaea",
-                  cursor: "pointer",
-                  fontWeight: 900,
-                }}
-              >
-                Fabric
-              </button>
-              <button
-                onClick={() => setRenderer("ltx")}
-                style={{
-                  padding: "8px 12px",
-                  border: "none",
-                  background: renderer === "ltx" ? "rgba(255,255,255,0.12)" : "transparent",
-                  color: "#eaeaea",
-                  cursor: "pointer",
-                  fontWeight: 900,
-                }}
-              >
-                LTX
-              </button>
-            </div>
+      <div style={{ marginTop: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+        <div style={{ fontWeight: 900, fontSize: 18 }}>Renderer</div>
+        <div
+          style={{
+            display: "inline-flex",
+            border: "1px solid rgba(255,255,255,0.14)",
+            borderRadius: 999,
+            overflow: "hidden",
+            background: "rgba(255,255,255,0.04)",
+          }}
+        >
+          <button
+            type="button"
+            onClick={() => setRenderer("fabric")}
+            style={{
+              padding: "8px 12px",
+              border: "none",
+              background: renderer === "fabric" ? "rgba(255,255,255,0.12)" : "transparent",
+              color: "#eaeaea",
+              cursor: "pointer",
+              fontWeight: 900,
+            }}
+          >
+            Fabric
+          </button>
+          <button
+            type="button"
+            onClick={() => setRenderer("ltx")}
+            style={{
+              padding: "8px 12px",
+              border: "none",
+              background: renderer === "ltx" ? "rgba(255,255,255,0.12)" : "transparent",
+              color: "#eaeaea",
+              cursor: "pointer",
+              fontWeight: 900,
+            }}
+          >
+            LTX
+          </button>
+          <button
+            type="button"
+            onClick={() => setRenderer("infinitalk")}
+            style={{
+              padding: "8px 12px",
+              border: "none",
+              background: renderer === "infinitalk" ? "rgba(255,255,255,0.12)" : "transparent",
+              color: "#eaeaea",
+              cursor: "pointer",
+              fontWeight: 900,
+            }}
+          >
+            Infinitalk
+          </button>
+        </div>
 
-            <div style={{ fontSize: 12, opacity: 0.75 }}>
-              {renderer === "fabric" ? (
-                "Best for predictable lip sync"
-              ) : (
-                <>
-                  <span style={{ fontWeight: 900, color: "#ffd36a" }}>Experimental:</span>{" "}
-                  Best for cinematic motion. More variable. Per line render.
-                </>
-              )}
-            </div>
-          </div>
-
-          {renderer === "ltx" && (
-            <div style={{ marginTop: 10 }}>
-              <div style={{ fontWeight: 800, marginBottom: 6 }}>LTX prompt (optional)</div>
-              <textarea
-                rows={3}
-                value={ltxPrompt}
-                onChange={(e) => setLtxPrompt(e.target.value)}
-                placeholder="Optional. Add style + motion notes (camera is forced static server-side). Example: soft daylight, subtle facial motion, still background."
-                style={{
-                  width: "100%",
-                  padding: 12,
-                  borderRadius: 12,
-                  border: "1px solid rgba(255,255,255,0.14)",
-                  background: "rgba(255,255,255,0.04)",
-                  color: "#eaeaea",
-                  fontSize: 14,
-                  lineHeight: 1.35,
-                }}
-              />
-              <div style={{ fontSize: 12, opacity: 0.6, marginTop: 6 }}>
-                Tip: keep it short. Focus on subtle facial motion and a still background.
-              </div>
-            </div>
+        <div style={{ fontSize: 12, opacity: 0.75, maxWidth: 560 }}>
+          {renderer === "fabric" ? (
+            "Fabric: predictable lip sync from stills (Veed Fabric pipeline)."
+          ) : renderer === "ltx" ? (
+            <>
+              <span style={{ fontWeight: 900, color: "#ffd36a" }}>LTX:</span> image + audio on fal;
+              experimental, more motion variance.
+            </>
+          ) : (
+            <>
+              <span style={{ fontWeight: 900, color: "#7ec8e3" }}>Infinitalk:</span> fal{" "}
+              <code style={{ fontSize: 11, opacity: 0.85 }}>video-to-video</code> — a short reference
+              clip is built from each line&apos;s still + WAV, then lip-synced.
+            </>
           )}
-        </>
+        </div>
+      </div>
+
+      {(renderer === "ltx" || renderer === "infinitalk") && (
+        <div style={{ marginTop: 10 }}>
+          <div style={{ fontWeight: 800, marginBottom: 6 }}>
+            {renderer === "ltx" ? "LTX prompt (optional)" : "Infinitalk prompt (optional)"}
+          </div>
+          <textarea
+            rows={3}
+            value={ltxPrompt}
+            onChange={(e) => setLtxPrompt(e.target.value)}
+            placeholder={
+              renderer === "ltx"
+                ? "Optional. Add style + motion notes (camera is forced static server-side). Example: soft daylight, subtle facial motion, still background."
+                : "Optional. Describe delivery, mood, or scene (reference is still+audio). Example: podcast host, warm tone, subtle expressions."
+            }
+            style={{
+              width: "100%",
+              padding: 12,
+              borderRadius: 12,
+              border: "1px solid rgba(255,255,255,0.14)",
+              background: "rgba(255,255,255,0.04)",
+              color: "#eaeaea",
+              fontSize: 14,
+              lineHeight: 1.35,
+            }}
+          />
+          <div style={{ fontSize: 12, opacity: 0.6, marginTop: 6 }}>
+            {renderer === "ltx"
+              ? "Tip: keep it short. Focus on subtle facial motion and a still background."
+              : "Tip: keep it short; the model still follows the reference video timing from your still."}
+          </div>
+        </div>
       )}
 
       {inputMode === "script" ? (
