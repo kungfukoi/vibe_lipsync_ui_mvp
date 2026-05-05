@@ -54,6 +54,26 @@ button:focus-visible {
   outline: 4px auto -webkit-focus-ring-color;
 }
 
+/* Keep dropdown text readable in both collapsed and expanded states. */
+select {
+  background-color: #3a3a3a;
+  color: #f3f3f3;
+}
+
+select option {
+  background-color: #3a3a3a;
+  color: #f3f3f3;
+}
+
+@keyframes lipsync-progress-flow {
+  from {
+    background-position: 0% 50%;
+  }
+  to {
+    background-position: 220% 50%;
+  }
+}
+
 @media (prefers-color-scheme: light) {
   :root {
     color: #213547;

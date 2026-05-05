@@ -5,6 +5,9 @@ import json
 import base64
 import shutil
 import subprocess
+import asyncio
+import uuid
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -116,6 +119,8 @@ def _cors_allow_origins() -> List[str]:
     out = [
         "http://127.0.0.1:5173",
         "http://localhost:5173",
+        "http://127.0.0.1:5174",
+        "http://localhost:5174",
         "http://127.0.0.1:4173",
         "http://localhost:4173",
     ]
@@ -248,18 +253,89 @@ def _write_lines_json(project_dir: Path, lines: List[Dict[str, Any]]) -> Path:
     return p
 
 
-_FFMPEG_MISSING = (
-    "ffmpeg not found. Install ffmpeg and add it to PATH, or set FFMPEG_PATH to the full path of ffmpeg.exe. "
-    "Windows (winget): winget install --id Gyan.FFmpeg"
-)
+def _ffmpeg_missing_detail() -> str:
+    base = (
+        "ffmpeg not found. Install ffmpeg and add it to PATH, or set FFMPEG_PATH to the full path of ffmpeg.exe. "
+        "Windows (winget): winget install --id Gyan.FFmpeg"
+    )
+    if os.name != "nt":
+        return (
+            base
+            + " On Linux servers (e.g. Render), install ffmpeg in the image or Dockerfile (e.g. apt-get install -y ffmpeg)."
+        )
+    return base + " If the UI calls a deployed API (Render), that server needs ffmpeg too—not only your Windows PC."
+
+
+def _find_ffmpeg_winget_windows() -> Optional[str]:
+    """Best-effort: WinGet Gyan.FFmpeg installs under LOCALAPPDATA\\Microsoft\\WinGet\\Packages."""
+    if os.name != "nt":
+        return None
+    base = (os.environ.get("LOCALAPPDATA") or "").strip()
+    if not base:
+        return None
+    pkg_root = Path(base) / "Microsoft" / "WinGet" / "Packages"
+    if not pkg_root.is_dir():
+        return None
+    try:
+        for folder in sorted(pkg_root.glob("Gyan.FFmpeg*"), reverse=True):
+            if not folder.is_dir():
+                continue
+            for exe in folder.rglob("ffmpeg.exe"):
+                if exe.is_file():
+                    return str(exe)
+    except Exception:
+        return None
+    return None
+
+
+def _find_ffmpeg_program_files_windows() -> Optional[str]:
+    """Common manual installs: %ProgramFiles%\\ffmpeg\\bin\\ffmpeg.exe."""
+    if os.name != "nt":
+        return None
+    for root in (
+        os.environ.get("ProgramFiles", r"C:\Program Files"),
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+    ):
+        if not root:
+            continue
+        p = Path(root) / "ffmpeg" / "bin" / "ffmpeg.exe"
+        if p.is_file():
+            return str(p)
+    return None
+
+
+def _where_ffmpeg_windows() -> Optional[str]:
+    """Use `where ffmpeg` (Windows) when shutil.which misses PATH edge cases."""
+    if os.name != "nt":
+        return None
+    try:
+        proc = subprocess.run(
+            ["where", "ffmpeg"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            shell=False,
+        )
+        if proc.returncode != 0:
+            return None
+        for line in (proc.stdout or "").splitlines():
+            cand = line.strip().strip("\ufeff")
+            if cand and Path(cand).is_file():
+                return cand
+    except Exception:
+        return None
+    return None
 
 
 def _resolve_ffmpeg() -> Optional[str]:
-    """Resolve ffmpeg: FFMPEG_PATH / IMAGEIO_FFMPEG_EXE, then PATH."""
+    """Resolve ffmpeg: env paths, PATH, Windows where/static/WinGet fallbacks."""
     from shutil import which
 
     for key in ("FFMPEG_PATH", "IMAGEIO_FFMPEG_EXE"):
         raw = os.environ.get(key)
+        if not raw:
+            continue
+        raw = str(raw).strip().strip("\ufeff")
         if not raw:
             continue
         p = Path(raw)
@@ -268,7 +344,17 @@ def _resolve_ffmpeg() -> Optional[str]:
         w = which(raw)
         if w:
             return w
-    return which("ffmpeg")
+    w = which("ffmpeg")
+    if w:
+        return w
+    if os.name == "nt":
+        w2 = _where_ffmpeg_windows()
+        if w2:
+            return w2
+        w3 = _find_ffmpeg_program_files_windows()
+        if w3:
+            return w3
+    return _find_ffmpeg_winget_windows()
 
 
 def _resolve_ffprobe() -> Optional[str]:
@@ -395,7 +481,7 @@ def _eleven_tts_to_wav(
 
     ffmpeg = _resolve_ffmpeg()
     if not ffmpeg:
-        raise HTTPException(status_code=500, detail=_FFMPEG_MISSING)
+        raise HTTPException(status_code=500, detail=_ffmpeg_missing_detail())
 
     proc = subprocess.run(
         [ffmpeg, "-y", "-i", str(mp3_path), str(wav_path)],
@@ -441,7 +527,7 @@ def _eleven_dialogue_to_wav_and_ranges(
 
     ffmpeg = _resolve_ffmpeg()
     if not ffmpeg:
-        raise HTTPException(status_code=500, detail=_FFMPEG_MISSING)
+        raise HTTPException(status_code=500, detail=_ffmpeg_missing_detail())
 
     url = "https://api.elevenlabs.io/v1/text-to-dialogue/with-timestamps"
     headers = {
@@ -557,7 +643,7 @@ def _convert_audio_to_wav(
 
     ffmpeg = _resolve_ffmpeg()
     if not ffmpeg:
-        raise HTTPException(status_code=500, detail=_FFMPEG_MISSING)
+        raise HTTPException(status_code=500, detail=_ffmpeg_missing_detail())
 
     if not in_audio_path.exists() or in_audio_path.stat().st_size == 0:
         raise HTTPException(status_code=400, detail=f"Input audio is missing or empty: {in_audio_path.name}")
@@ -606,7 +692,7 @@ def _eleven_sts_to_wav(
 
     ffmpeg = _resolve_ffmpeg()
     if not ffmpeg:
-        raise HTTPException(status_code=500, detail=_FFMPEG_MISSING)
+        raise HTTPException(status_code=500, detail=_ffmpeg_missing_detail())
 
     if not in_audio_path.exists() or in_audio_path.stat().st_size == 0:
         raise HTTPException(status_code=400, detail=f"Input audio is missing or empty: {in_audio_path.name}")
@@ -1025,8 +1111,81 @@ def _stitch_preview(project_dir: Path) -> Optional[Path]:
     return out_path
 
 
+def _fal_subscribe_timeout_sec() -> float:
+    """fal_client.subscribe blocks until the queue finishes; InfiniTalk/LTX can take many minutes per line."""
+    try:
+        v = float(os.getenv("FAL_CLIENT_TIMEOUT_SEC", "3600") or 3600)
+    except Exception:
+        v = 3600.0
+    return max(300.0, min(v, 7200.0))
+
+
+def _fal_extract_video_url(result: Any) -> Optional[str]:
+    """Normalize fal output shapes (subscribe may return top-level dict or nested under data/output)."""
+    if result is None:
+        return None
+    if isinstance(result, str) and result.startswith("http"):
+        return result
+
+    def _from_video_block(o: Any) -> Optional[str]:
+        if not isinstance(o, dict):
+            return None
+        v = o.get("video")
+        if isinstance(v, str) and v.startswith("http"):
+            return v
+        if isinstance(v, dict):
+            u = v.get("url")
+            if isinstance(u, str) and u.startswith("http"):
+                return u
+        return None
+
+    if not isinstance(result, dict):
+        return None
+    u = _from_video_block(result)
+    if u:
+        return u
+    for key in ("data", "output", "result"):
+        inner = result.get(key)
+        if isinstance(inner, dict):
+            u = _from_video_block(inner)
+            if u:
+                return u
+    return None
+
+
+def _infinitalk_num_frames() -> int:
+    """fal-ai/infinitalk/video-to-video documents num_frames in 81..129 for this endpoint."""
+    try:
+        n = int(os.getenv("INFINITALK_NUM_FRAMES", "97") or 97)
+    except Exception:
+        n = 97
+    return max(81, min(129, n))
+
+
+def _infinitalk_num_frames_optional() -> Optional[int]:
+    """Return num_frames only when explicitly configured.
+
+    Leaving num_frames unset lets the upstream model choose defaults that better match
+    varying line durations.
+    """
+    raw = (os.getenv("INFINITALK_NUM_FRAMES", "") or "").strip()
+    if not raw:
+        return None
+    return _infinitalk_num_frames()
+
+
+def _infinitalk_resolution() -> str:
+    r = (os.getenv("INFINITALK_RESOLUTION", "480p") or "480p").strip().lower()
+    return r if r in {"480p", "720p"} else "480p"
+
+
+def _infinitalk_acceleration() -> str:
+    a = (os.getenv("INFINITALK_ACCELERATION", "regular") or "regular").strip().lower()
+    return a if a in {"none", "regular", "high"} else "regular"
+
+
 # --- LTX Audio-to-Video (per-line) helper ---
-def _render_ltx_project(pdir: Path, prompt: str = "") -> None:
+def _render_ltx_project(pdir: Path, prompt: str = "", progress_cb: Optional[Any] = None) -> None:
     """Render per-line mp4 clips using LTX Audio-to-Video on fal.
 
     For each entry in lines.json:
@@ -1105,11 +1264,23 @@ def _render_ltx_project(pdir: Path, prompt: str = "") -> None:
         raise HTTPException(status_code=500, detail=_FAL_KEY_MISSING)
     old_fal = os.environ.get("FAL_KEY")
     os.environ["FAL_KEY"] = fk
-    try:
-        for item in lines:
+    line_items: List[Dict[str, Any]] = []
+    for item in lines:
+        try:
             idx = int(item.get("index", 0) or 0)
-            if idx <= 0:
-                continue
+        except Exception:
+            idx = 0
+        if idx > 0:
+            line_items.append(item)
+
+    total = max(1, len(line_items))
+    completed = 0
+    if callable(progress_cb):
+        progress_cb(0.0, "Starting LTX per-line renders")
+
+    try:
+        for item in line_items:
+            idx = int(item.get("index", 0) or 0)
 
             speaker = str(item.get("speaker", "") or "").strip().upper()
             if speaker not in {"A", "B"}:
@@ -1162,20 +1333,26 @@ def _render_ltx_project(pdir: Path, prompt: str = "") -> None:
                     # No LoRAs by default.
                     "loras": [],
                 },
+                client_timeout=_fal_subscribe_timeout_sec(),
             )
 
-            video_url = None
-            if isinstance(result, dict):
-                video_url = (result.get("video") or {}).get("url")
+            video_url = _fal_extract_video_url(result)
 
             if not video_url:
-                raise HTTPException(status_code=500, detail=f"LTX returned no video url for line {idx}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"LTX returned no video url for line {idx}. Raw keys: {list(result.keys()) if isinstance(result, dict) else type(result).__name__}",
+                )
 
             r = requests.get(video_url, timeout=300)
             if r.status_code != 200 or not r.content:
                 raise HTTPException(status_code=500, detail=f"Failed to download LTX video for line {idx}")
 
             out_mp4.write_bytes(r.content)
+
+            completed += 1
+            if callable(progress_cb):
+                progress_cb(completed / float(total), f"Rendered LTX line {idx}")
     finally:
         if old_fal is None:
             os.environ.pop("FAL_KEY", None)
@@ -1216,7 +1393,7 @@ def _ffmpeg_ref_video_from_still_and_audio(ffmpeg: str, image_path: Path, audio_
         raise HTTPException(status_code=500, detail=f"ffmpeg ref video for Infinitalk failed: {tail}")
 
 
-def _render_infinitalk_project(pdir: Path, prompt: str = "") -> None:
+def _render_infinitalk_project(pdir: Path, prompt: str = "", progress_cb: Optional[Any] = None) -> None:
     """Per-line talking-head clips via fal-ai/infinitalk/video-to-video.
 
     Infinitalk expects video_url + audio_url. We synthesize a reference video from the line's still
@@ -1256,7 +1433,7 @@ def _render_infinitalk_project(pdir: Path, prompt: str = "") -> None:
 
     ffmpeg = _resolve_ffmpeg()
     if not ffmpeg:
-        raise HTTPException(status_code=500, detail=_FFMPEG_MISSING)
+        raise HTTPException(status_code=500, detail=_ffmpeg_missing_detail())
 
     static_prefix = (
         "Talking head, natural lip sync to the provided audio. Static camera, locked framing, "
@@ -1279,11 +1456,23 @@ def _render_infinitalk_project(pdir: Path, prompt: str = "") -> None:
         raise HTTPException(status_code=500, detail=_FAL_KEY_MISSING)
     old_fal = os.environ.get("FAL_KEY")
     os.environ["FAL_KEY"] = fk
-    try:
-        for item in lines:
+    line_items: List[Dict[str, Any]] = []
+    for item in lines:
+        try:
             idx = int(item.get("index", 0) or 0)
-            if idx <= 0:
-                continue
+        except Exception:
+            idx = 0
+        if idx > 0:
+            line_items.append(item)
+
+    total = max(1, len(line_items))
+    completed = 0
+    if callable(progress_cb):
+        progress_cb(0.0, "Starting InfiniTalk per-line renders")
+
+    try:
+        for item in line_items:
+            idx = int(item.get("index", 0) or 0)
 
             speaker = str(item.get("speaker", "") or "").strip().upper()
             if speaker not in {"A", "B"}:
@@ -1309,31 +1498,44 @@ def _render_infinitalk_project(pdir: Path, prompt: str = "") -> None:
                 video_url = fal_client.upload_file(str(ref_mp4))
                 audio_url = fal_client.upload_file(str(audio_path))
 
+                args: Dict[str, Any] = {
+                    "video_url": video_url,
+                    "audio_url": audio_url,
+                    "prompt": final_prompt,
+                    "resolution": _infinitalk_resolution(),
+                    "seed": 42,
+                    "acceleration": _infinitalk_acceleration(),
+                }
+                nf = _infinitalk_num_frames_optional()
+                if nf is not None:
+                    args["num_frames"] = nf
+
                 result = fal_client.subscribe(
                     endpoint,
-                    arguments={
-                        "video_url": video_url,
-                        "audio_url": audio_url,
-                        "prompt": final_prompt,
-                        "num_frames": 97,
-                        "resolution": "480p",
-                        "seed": 42,
-                        "acceleration": "regular",
-                    },
+                    arguments=args,
+                    client_timeout=_fal_subscribe_timeout_sec(),
                 )
 
-                out_video_url = None
-                if isinstance(result, dict):
-                    out_video_url = (result.get("video") or {}).get("url")
+                out_video_url = _fal_extract_video_url(result)
 
                 if not out_video_url:
-                    raise HTTPException(status_code=500, detail=f"Infinitalk returned no video url for line {idx}")
+                    raise HTTPException(
+                        status_code=500,
+                        detail=(
+                            f"Infinitalk returned no video url for line {idx}. "
+                            f"Raw keys: {list(result.keys()) if isinstance(result, dict) else type(result).__name__}"
+                        ),
+                    )
 
                 r = requests.get(out_video_url, timeout=300)
                 if r.status_code != 200 or not r.content:
                     raise HTTPException(status_code=500, detail=f"Failed to download Infinitalk video for line {idx}")
 
                 out_mp4.write_bytes(r.content)
+
+                completed += 1
+                if callable(progress_cb):
+                    progress_cb(completed / float(total), f"Rendered InfiniTalk line {idx}")
             finally:
                 try:
                     ref_mp4.unlink(missing_ok=True)
@@ -1350,6 +1552,340 @@ def _render_infinitalk_project(pdir: Path, prompt: str = "") -> None:
 app = FastAPI(title="LipSync UI MVP Backend")
 
 _cors_regex = os.getenv("CORS_ORIGIN_REGEX", "").strip() or None
+
+# --- Render job progress (in-memory; dev/local only) ---
+_RENDER_JOBS_LOCK = threading.Lock()
+_RENDER_JOBS: Dict[str, Dict[str, Any]] = {}
+
+
+def _job_log(job_id: str, pct: float, stage: str, message: str = "") -> None:
+    verbose = (os.getenv("PROGRESS_VERBOSE", "1").strip().lower() in {"1", "true", "yes", "y"})
+    if not verbose:
+        return
+    msg = f"[job {job_id}] {stage} {pct:.0f}%"
+    if message:
+        msg += f" - {message}"
+    print(msg, flush=True)
+
+
+def _job_update(
+    job_id: str,
+    *,
+    pct: float,
+    stage: str,
+    message: str = "",
+    done: bool | None = None,
+    error: str | None = None,
+    outputs: List[str] | None = None,
+    preview: str | None = None,
+    outputs_dir: str | None = None,
+) -> None:
+    now = time.time()
+    with _RENDER_JOBS_LOCK:
+        j = _RENDER_JOBS.get(job_id)
+        if not j:
+            j = {}
+            _RENDER_JOBS[job_id] = j
+        j.update(
+            {
+                "job_id": job_id,
+                "pct": float(pct),
+                "stage": stage,
+                "message": message,
+                "updated_at": now,
+            }
+        )
+        if done is not None:
+            j["done"] = bool(done)
+        if error is not None:
+            j["error"] = error
+        if outputs is not None:
+            j["outputs"] = outputs
+        if preview is not None:
+            j["preview"] = preview
+        if outputs_dir is not None:
+            j["outputs_dir"] = outputs_dir
+
+    _job_log(job_id, float(pct), stage, message)
+
+
+def _job_create(job_id: str) -> None:
+    _job_update(job_id, pct=0, stage="queued", message="Render job created", done=False)
+
+
+def _job_get(job_id: str) -> Optional[Dict[str, Any]]:
+    with _RENDER_JOBS_LOCK:
+        j = _RENDER_JOBS.get(job_id)
+        # Return a shallow copy so the caller can't mutate under lock.
+        return dict(j) if j else None
+
+
+def _render_with_progress(payload: Dict[str, Any], job_id: str) -> Dict[str, Any]:
+    """Run the existing /api/render pipeline but report progress into _RENDER_JOBS."""
+
+    def report(pct: float, stage: str, message: str = "") -> None:
+        _job_update(job_id, pct=pct, stage=stage, message=message)
+
+    # Use same validation logic as /api/render, but with progress updates.
+    project_dir = payload.get("project_dir")
+    if not project_dir:
+        raise HTTPException(status_code=400, detail="project_dir is required")
+
+    pdir = Path(project_dir)
+    if not pdir.exists():
+        raise HTTPException(status_code=400, detail="project_dir not found")
+
+    report(1, "init", "Ensuring project env")
+    _ensure_project_env(pdir)
+
+    renderer = str(payload.get("renderer", "fabric") or "fabric").strip().lower()
+    if renderer not in {"fabric", "ltx", "infinitalk"}:
+        raise HTTPException(status_code=400, detail="renderer must be 'fabric', 'ltx', or 'infinitalk'")
+
+    # New canonical field: renderer_prompt. Keep ltx_prompt as backward-compatible fallback.
+    renderer_prompt = str(payload.get("renderer_prompt", payload.get("ltx_prompt", "")) or "")
+
+    report(5, "validate", "Checking inputs")
+    missing = []
+    for needed in ["lines.json", "visuals.json"]:
+        if not (pdir / needed).exists():
+            missing.append(needed)
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Missing: {', '.join(missing)}")
+
+    try:
+        vdata = json.loads((pdir / "visuals.json").read_text(encoding="utf-8"))
+        vmap = vdata.get("visuals", {})
+    except Exception:
+        vmap = {}
+
+    if not isinstance(vmap, dict) or not vmap:
+        raise HTTPException(status_code=400, detail="visuals.json has no visuals mapping")
+
+    any_exists = False
+    for fname in vmap.values():
+        if fname and (pdir / str(fname)).exists():
+            any_exists = True
+            break
+
+    if not any_exists:
+        raise HTTPException(status_code=400, detail="No visual image files found for visuals.json mapping")
+
+    # Audio check
+    if not list(pdir.glob("line_*.wav")):
+        raise HTTPException(status_code=400, detail="No line_XXX.wav audio found. Run Step 1/3 first.")
+
+    if renderer == "fabric":
+        report(15, "fabric", "Running Fabric generator")
+        if not GEN_FABRIC_PY.exists():
+            raise HTTPException(
+                status_code=500,
+                detail=f"Missing Fabric generator script. Expected at: {GEN_FABRIC_PY}. (Set FABRIC_GENERATOR_PATH to override.)",
+            )
+
+        proc = subprocess.run(
+            [sys.executable, str(GEN_FABRIC_PY)],
+            cwd=str(pdir),
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+        )
+        if proc.returncode != 0:
+            raise HTTPException(
+                status_code=500,
+                detail="Fabric generator failed",
+            )
+        report(85, "stitch", "Stitching preview")
+    elif renderer == "ltx":
+        report(15, "rendering", "Preparing LTX render")
+
+        def make_line_progress(total: int):
+            def _cb(rel: float, message: str = "") -> None:
+                pct = 15 + float(rel) * 70.0
+                report(pct, "rendering", message or "Rendering LTX lines")
+
+            return _cb
+
+        # We need total to map to 15..85. Infer from lines.json after validation.
+        lines = json.loads((pdir / "lines.json").read_text(encoding="utf-8"))
+        line_items = []
+        for it in lines:
+            idx = int(it.get("index", 0) or 0)
+            if idx > 0:
+                line_items.append(it)
+        total = max(1, len(line_items))
+        line_progress_cb = make_line_progress(total)
+        _render_ltx_project(pdir, prompt=renderer_prompt, progress_cb=line_progress_cb)
+        report(85, "stitch", "Stitching preview")
+    else:
+        # infinitalk
+        report(15, "rendering", "Preparing InfiniTalk render")
+
+        def make_line_progress():
+            def _cb(rel: float, message: str = "") -> None:
+                pct = 15 + float(rel) * 70.0
+                report(pct, "rendering", message or "Rendering InfiniTalk lines")
+
+            return _cb
+
+        lines = json.loads((pdir / "lines.json").read_text(encoding="utf-8"))
+        line_items = []
+        for it in lines:
+            idx = int(it.get("index", 0) or 0)
+            if idx > 0:
+                line_items.append(it)
+        total = max(1, len(line_items))
+        line_progress_cb = make_line_progress()
+        _render_infinitalk_project(pdir, prompt=renderer_prompt, progress_cb=line_progress_cb)
+        report(85, "stitch", "Stitching preview")
+
+    stitched = _stitch_preview(pdir)
+    if stitched is None:
+        # Hard fallback: ensure a stable preview file exists
+        intro = pdir / "00_intro_ws_final.mp4"
+        outp = pdir / "output_fabric.mp4"
+        try:
+            if intro.exists() and not outp.exists():
+                shutil.copy2(intro, outp)
+        except Exception:
+            pass
+
+    outputs_dir = pdir / "outputs"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+
+    report(92, "collect", "Collecting rendered outputs")
+    mp4s = sorted([p.name for p in pdir.glob("*.mp4") if p.name != "00_ws_full.mp4"])
+    out_names: List[str] = []
+    for name in mp4s:
+        src = pdir / name
+        dst = outputs_dir / name
+        try:
+            shutil.copy2(src, dst)
+            out_names.append(name)
+        except Exception:
+            pass
+
+    preview = "output_fabric.mp4" if (outputs_dir / "output_fabric.mp4").exists() else ""
+    if not preview:
+        mp4s_out = sorted([p.name for p in outputs_dir.glob("*.mp4")])
+        if mp4s_out:
+            try:
+                shutil.copy2(outputs_dir / mp4s_out[0], outputs_dir / "output_fabric.mp4")
+                preview = "output_fabric.mp4"
+                if "output_fabric.mp4" not in out_names:
+                    out_names.append("output_fabric.mp4")
+            except Exception:
+                preview = mp4s_out[0]
+
+    if not preview:
+        raise HTTPException(status_code=500, detail="Preview could not be created")
+
+    report(100, "done", "Render job completed")
+    return {"outputs_dir": str(outputs_dir), "outputs": out_names, "preview": preview}
+
+
+@app.post("/api/render_job")
+async def render_job(payload: Dict[str, Any]) -> JSONResponse:
+    """Async variant of /api/render that reports progress via /api/job_status."""
+
+    job_id = uuid.uuid4().hex
+    _job_create(job_id)
+
+    async def runner() -> None:
+        try:
+            result = await asyncio.to_thread(_render_with_progress, payload, job_id)
+            _job_update(
+                job_id,
+                pct=100,
+                stage="done",
+                message="Render job completed",
+                done=True,
+                outputs=result.get("outputs"),
+                preview=result.get("preview"),
+                outputs_dir=result.get("outputs_dir"),
+            )
+        except HTTPException as e:
+            j = _job_get(job_id) or {}
+            _job_update(
+                job_id,
+                pct=j.get("pct", 0),
+                stage="error",
+                message="Render failed",
+                done=True,
+                error=str(e.detail),
+            )
+        except Exception as e:
+            j = _job_get(job_id) or {}
+            _job_update(
+                job_id,
+                pct=j.get("pct", 0),
+                stage="error",
+                message="Render failed",
+                done=True,
+                error=str(e),
+            )
+
+    asyncio.create_task(runner())
+    return JSONResponse({"job_id": job_id})
+
+
+@app.get("/api/job_status")
+def job_status(job_id: str) -> JSONResponse:
+    """Return progress + result for a render_job."""
+
+    j = _job_get(job_id)
+    if not j:
+        return JSONResponse({"error": "job not found"}, status_code=404)
+    return JSONResponse(j)
+
+
+@app.post("/api/open_project_folder")
+def open_project_folder(payload: Dict[str, Any]) -> JSONResponse:
+    """Open a local project folder in the OS file explorer (for local dev use)."""
+
+    project_dir = str(payload.get("project_dir", "") or "").strip()
+    projects_root = PROJECTS_DIR.resolve()
+
+    # Default/fallback: open backend/projects (one level above specific project folders).
+    target_dir = projects_root
+    if project_dir:
+        pdir = Path(project_dir).resolve()
+        # Only allow paths under backend/projects.
+        try:
+            pdir.relative_to(projects_root)
+        except Exception:
+            return JSONResponse({"error": "project_dir must be under backend/projects"}, status_code=400)
+        # If requested folder exists, open it; otherwise open the parent projects folder.
+        if pdir.exists() and pdir.is_dir():
+            target_dir = pdir
+
+    try:
+        if sys.platform.startswith("win"):
+            # Launch Explorer and then try to bring it to foreground.
+            subprocess.Popen(["explorer", str(target_dir)])
+            try:
+                subprocess.Popen(
+                    [
+                        "powershell",
+                        "-NoProfile",
+                        "-Command",
+                        "$ws = New-Object -ComObject WScript.Shell; "
+                        "Start-Sleep -Milliseconds 250; "
+                        "$null = $ws.AppActivate('File Explorer')",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                pass
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(target_dir)])
+        else:
+            subprocess.Popen(["xdg-open", str(target_dir)])
+    except Exception as e:
+        return JSONResponse({"error": f"failed to open folder: {e}"}, status_code=500)
+
+    return JSONResponse({"ok": True, "project_dir": str(target_dir)})
 
 # Last-added middleware runs first: CORS handles preflight, then BYOK sets request-scoped keys.
 app.add_middleware(BYOKMiddleware)
@@ -1550,10 +2086,13 @@ async def upload_masks(
 def health() -> Dict[str, Any]:
     e = _resolve_eleven_api_key()
     f = _resolve_fal_key()
+    ff = _resolve_ffmpeg()
     return {
         "ok": True,
         "ELEVEN_API_KEY_loaded": bool(e),
         "FAL_KEY_loaded": bool(f),
+        "ffmpeg_resolved": bool(ff),
+        "platform": sys.platform,
     }
 
 
@@ -1852,7 +2391,8 @@ def render(payload: Dict[str, Any]) -> JSONResponse:
     if renderer not in {"fabric", "ltx", "infinitalk"}:
         return JSONResponse({"error": "renderer must be 'fabric', 'ltx', or 'infinitalk'"}, status_code=400)
 
-    ltx_prompt = str(payload.get("ltx_prompt", "") or "")
+    # New canonical field: renderer_prompt. Keep ltx_prompt as backward-compatible fallback.
+    renderer_prompt = str(payload.get("renderer_prompt", payload.get("ltx_prompt", "")) or "")
 
     # Required inputs
     missing = []
@@ -1914,7 +2454,7 @@ def render(payload: Dict[str, Any]) -> JSONResponse:
 
     elif renderer == "ltx":
         try:
-            _render_ltx_project(pdir, prompt=ltx_prompt)
+            _render_ltx_project(pdir, prompt=renderer_prompt)
         except HTTPException as e:
             return JSONResponse({"error": str(e.detail)}, status_code=e.status_code)
         except Exception as e:
@@ -1923,7 +2463,7 @@ def render(payload: Dict[str, Any]) -> JSONResponse:
     else:
         # infinitalk
         try:
-            _render_infinitalk_project(pdir, prompt=ltx_prompt)
+            _render_infinitalk_project(pdir, prompt=renderer_prompt)
         except HTTPException as e:
             return JSONResponse({"error": str(e.detail)}, status_code=e.status_code)
         except Exception as e:
@@ -2209,7 +2749,7 @@ def generate_audio(payload: Dict[str, Any]) -> JSONResponse:
         else:
             ffmpeg = _resolve_ffmpeg()
             if not ffmpeg:
-                raise HTTPException(status_code=500, detail=_FFMPEG_MISSING)
+                raise HTTPException(status_code=500, detail=_ffmpeg_missing_detail())
 
             # Split per line using the returned per-input ranges
             # Padding can cause overlap/bleed between adjacent lines (you'll hear the next line early).

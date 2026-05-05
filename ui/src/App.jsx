@@ -5,8 +5,51 @@ import { apiFetch, LS_ELEVEN, LS_FAL } from "./api";
 const API_RAW = import.meta.env.VITE_API_URL;
 const API =
   (typeof API_RAW === "string" && API_RAW.trim() !== "" ? API_RAW.trim().replace(/\/$/, "") : null) ||
-  "http://127.0.0.1:8000";
+  "http://localhost:8001";
+const API_FALLBACK =
+  API.startsWith("http://127.0.0.1:") ? API.replace("http://127.0.0.1:", "http://localhost:") : null;
 const PROD_MISSING_API_URL = import.meta.env.PROD && !API_RAW;
+
+function clampProgress(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(100, n));
+}
+
+function outputFolderForProject(projectDir) {
+  const dir = String(projectDir || "").trim();
+  if (!dir) return "";
+  const sep = dir.includes("\\") ? "\\" : "/";
+  return `${dir.replace(/[\\/]+$/, "")}${sep}outputs`;
+}
+
+function fileToProjectAsset(file) {
+  if (!(file instanceof File)) return Promise.resolve(null);
+
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      resolve({
+        name: file.name,
+        type: file.type,
+        lastModified: file.lastModified,
+        dataUrl: String(reader.result || ""),
+      });
+    };
+    reader.onerror = () => reject(reader.error || new Error("Could not read file"));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function projectAssetToFile(asset) {
+  if (!asset?.dataUrl) return null;
+  const res = await fetch(asset.dataUrl);
+  const blob = await res.blob();
+  return new File([blob], asset.name || "asset", {
+    type: asset.type || blob.type,
+    lastModified: asset.lastModified || Date.now(),
+  });
+}
 
 function ShotBox({ label, hint, file, setFile, aspect = "16:9", warn, badge }) {
   const [thumbUrl, setThumbUrl] = useState("");
@@ -136,6 +179,7 @@ export default function App() {
   const [apiOk, setApiOk] = useState(null); // null | true | false
   const [apiHint, setApiHint] = useState("");
   const [byokRefresh, setByokRefresh] = useState(0);
+  const [showApiKeys, setShowApiKeys] = useState(false);
   const [elevenDraft, setElevenDraft] = useState(() => {
     try {
       return localStorage.getItem(LS_ELEVEN) || "";
@@ -268,6 +312,7 @@ export default function App() {
   const [shotThumbUrls, setShotThumbUrls] = useState({}); // { [tag]: objectUrl }
   const [audioPreviewUrls, setAudioPreviewUrls] = useState({}); // { [lineIndex]: objectUrl }
   const audioPlayersRef = useRef(new Map()); // Map<number, HTMLAudioElement>
+  const projectFileInputRef = useRef(null);
   const [playingAudioIdx, setPlayingAudioIdx] = useState(null); // number | null
   const [audioLines, setAudioLines] = useState([
     { shot_tag: "1", file: null },
@@ -280,6 +325,11 @@ export default function App() {
   const [outputs, setOutputs] = useState([]);
   const [previewUrl, setPreviewUrl] = useState("");
   const [showPreview, setShowPreview] = useState(false);
+  const [renderJobId, setRenderJobId] = useState(null);
+  const [renderProgress, setRenderProgress] = useState({ pct: 0, stage: "", message: "" });
+  const [displayProgressPct, setDisplayProgressPct] = useState(0);
+  const [renderProjectDir, setRenderProjectDir] = useState("");
+  const [renderOutputsDir, setRenderOutputsDir] = useState("");
 
   function addScriptLine() {
     setScriptLines((prev) => {
@@ -384,7 +434,9 @@ export default function App() {
     if (inputMode !== "script") return true;
     if (!scriptLines.length) return false;
     const shotMap = new Map(shots.map((s) => [normTag(s.tag), s]));
-    return scriptLines.every((l) => {
+    const activeLines = scriptLines.filter((l) => String(l.text || "").trim());
+    if (!activeLines.length) return false;
+    return activeLines.every((l) => {
       const txt = String(l.text || "").trim();
       if (!txt) return false;
       const t = normTag(l.shot_tag);
@@ -400,7 +452,9 @@ export default function App() {
     if (inputMode !== "audio") return true;
     if (!audioLines.length) return false;
     const shotMap = new Map(shots.map((s) => [normTag(s.tag), s]));
-    return audioLines.every((l) => {
+    const activeLines = audioLines.filter((l) => !!l.file);
+    if (!activeLines.length) return false;
+    return activeLines.every((l) => {
       if (!l.file) return false;
       const t = normTag(l.shot_tag);
       if (!t) return false;
@@ -487,11 +541,9 @@ export default function App() {
   }, [inputMode, audioLines]);
 
   const canGenerate = useMemo(() => {
+    const uploadedShots = shots.filter((s) => !!s.image);
     const baseOk =
-      shots.length >= 3 &&
-      !!shots[0]?.image &&
-      !!shots[1]?.image &&
-      !!shots[2]?.image &&
+      uploadedShots.length >= 1 &&
       projectName.trim().length > 0 &&
       !busy;
 
@@ -501,8 +553,45 @@ export default function App() {
       return scriptReady;
     }
 
-    return audioReady;
-  }, [shots, projectName, busy, inputMode, audioReady, scriptReady, scriptLines]);
+      return audioReady;
+  }, [shots, projectName, busy, inputMode, audioReady, scriptReady]);
+
+  useEffect(() => {
+    if (!renderJobId) {
+      setDisplayProgressPct(0);
+      return;
+    }
+
+    setDisplayProgressPct((prev) => Math.max(prev, clampProgress(renderProgress.pct)));
+
+    if (clampProgress(renderProgress.pct) >= 100) {
+      setDisplayProgressPct(100);
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      setDisplayProgressPct((prev) => {
+        const serverPct = clampProgress(renderProgress.pct);
+        const base = Math.max(prev, serverPct);
+        if (serverPct >= 100) return 100;
+
+        const stage = String(renderProgress.stage || "").toLowerCase();
+        const softCap =
+          stage === "stitch" ? 94 :
+          stage === "collect" ? 98 :
+          stage === "done" ? 100 :
+          88;
+
+        if (base >= softCap) return base;
+
+        const room = softCap - base;
+        const step = Math.max(0.18, Math.min(1.15, room * 0.025));
+        return Math.min(softCap, base + step);
+      });
+    }, 450);
+
+    return () => window.clearInterval(timer);
+  }, [renderJobId, renderProgress.pct, renderProgress.stage]);
 
   // Visual tag coverage warnings
   const scriptVisualTags = useMemo(() => {
@@ -527,40 +616,57 @@ export default function App() {
 
   useEffect(() => {
     async function loadVoices() {
+      const apiBases = API_FALLBACK ? [API, API_FALLBACK] : [API];
       setVoicesStatus("Loading voices...");
       setApiHint("");
+      let resolvedBase = "";
 
-      // 1) Quick health check (best-effort)
-      try {
-        const healthRes = await apiFetch(`${API}/api/health`);
-        if (healthRes.ok) {
+      // 1) Health check with localhost fallback for browsers that dislike 127.0.0.1
+      for (const base of apiBases) {
+        try {
+          const healthRes = await apiFetch(`${base}/api/health`);
+          if (!healthRes.ok) {
+            continue;
+          }
+          resolvedBase = base;
           setApiOk(true);
-        } else {
-          setApiOk(false);
-          const t = await healthRes.text();
-          setApiHint(t ? `Health check responded, but not OK: ${t}` : "Health check responded, but not OK.");
+          break;
+        } catch (_err) {
+          // try next base
         }
-      } catch (e) {
+      }
+      if (!resolvedBase) {
         setApiOk(false);
         setApiHint("Cannot reach backend. Check VITE_API_URL / API URL and that the server is running.");
+      } else if (resolvedBase !== API) {
+        setApiHint(`Using ${resolvedBase} (fallback from ${API}).`);
       }
 
-      // 2) Voices fetch
+      // 2) Voices fetch (use whichever base succeeded health check)
+      const voicesBase = resolvedBase || API;
       try {
-        const res = await apiFetch(`${API}/api/voices`);
+        const res = await apiFetch(`${voicesBase}/api/voices`);
         if (!res.ok) {
           const t = await res.text();
           setVoices([]);
           setVoicesStatus(`Failed to load voices (${res.status}). ${t || ""}`.trim());
+          if (resolvedBase) {
+            setApiOk(true);
+          } else {
+            setApiOk(false);
+          }
           return;
         }
         const data = await res.json();
         const list = data.voices || [];
         setVoices(list);
         setVoicesStatus(list.length ? "" : "No voices found.");
-      } catch (e) {
+      } catch (_err) {
         setVoices([]);
         setVoicesStatus("Failed to load voices. Check backend and CORS.");
+        if (!resolvedBase) {
+          setApiOk(false);
+        }
       }
     }
     loadVoices();
@@ -642,13 +748,135 @@ export default function App() {
   
     return new File([blob], file.name.replace(/\.[^.]+$/, "") + "_inv.png", { type: "image/png" });
   }
+
+  async function saveProjectFile() {
+    try {
+      setStatus("Saving project...");
+
+      const savedShots = await Promise.all(
+        shots.map(async (s) => ({
+          tag: s.tag,
+          mask_invert: !!s.mask_invert,
+          voice_id: s.voice_id || "",
+          image: await fileToProjectAsset(s.image),
+          mask: await fileToProjectAsset(s.mask),
+        }))
+      );
+
+      const savedAudioLines = await Promise.all(
+        audioLines.map(async (l) => ({
+          shot_tag: l.shot_tag,
+          file: await fileToProjectAsset(l.file),
+        }))
+      );
+
+      const payload = {
+        type: "vibe-lipsync-project",
+        version: 1,
+        saved_at: new Date().toISOString(),
+        projectName,
+        format,
+        performance,
+        inputMode,
+        renderer,
+        ltxPrompt,
+        useNativeAudio,
+        useDialogueMode,
+        script,
+        scriptLines,
+        audioLines: savedAudioLines,
+        shots: savedShots,
+      };
+
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      const safeName = (projectName || "episode").trim().replace(/[^a-z0-9-_]+/gi, "_") || "episode";
+      a.href = url;
+      a.download = `${safeName}.lipsync-project.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      setStatus("Project saved.");
+    } catch {
+      setStatus("Project save failed.");
+    }
+  }
+
+  async function openProjectFile(file) {
+    if (!file) return;
+
+    try {
+      setStatus("Opening project...");
+      const raw = await file.text();
+      const data = JSON.parse(raw);
+
+      if (data?.type !== "vibe-lipsync-project") {
+        setStatus("Open project failed: not a Vibe Lipsync project file.");
+        return;
+      }
+
+      const restoredShots = await Promise.all(
+        (Array.isArray(data.shots) ? data.shots : []).map(async (s, idx) => ({
+          tag: String(s?.tag || idx + 1),
+          image: await projectAssetToFile(s?.image),
+          mask: await projectAssetToFile(s?.mask),
+          mask_invert: !!s?.mask_invert,
+          voice_id: String(s?.voice_id || ""),
+        }))
+      );
+
+      const restoredAudioLines = await Promise.all(
+        (Array.isArray(data.audioLines) ? data.audioLines : []).map(async (l) => ({
+          shot_tag: String(l?.shot_tag || "1"),
+          file: await projectAssetToFile(l?.file),
+        }))
+      );
+
+      setProjectName(String(data.projectName || "scene"));
+      setFormat(data.format === "9:16" ? "9:16" : "16:9");
+      setPerformance(typeof data.performance === "number" ? data.performance : DEFAULT_PERFORMANCE);
+      setInputMode(data.inputMode === "audio" ? "audio" : "script");
+      setRenderer(["fabric", "ltx", "infinitalk"].includes(data.renderer) ? data.renderer : "fabric");
+      setLtxPrompt(String(data.ltxPrompt || ""));
+      setUseNativeAudio(!!data.useNativeAudio);
+      setUseDialogueMode(data.useDialogueMode !== false);
+      setScript(String(data.script || ""));
+      setScriptLines(
+        Array.isArray(data.scriptLines) && data.scriptLines.length
+          ? data.scriptLines.map((l) => ({ shot_tag: String(l?.shot_tag || "1"), text: String(l?.text || "") }))
+          : [{ shot_tag: "1", text: "" }]
+      );
+      setAudioLines(restoredAudioLines.length ? restoredAudioLines : [{ shot_tag: "1", file: null }]);
+      setShots(restoredShots.length ? restoredShots : [{ tag: "1", image: null, mask: null, mask_invert: false, voice_id: "" }]);
+
+      setShowPreview(false);
+      setPreviewUrl("");
+      setOutputs([]);
+      setRenderJobId(null);
+      setRenderProgress({ pct: 0, stage: "", message: "" });
+      setDisplayProgressPct(0);
+      setRenderProjectDir("");
+      setRenderOutputsDir("");
+      setStatus("Project opened.");
+    } catch {
+      setStatus("Open project failed.");
+    }
+  }
+
   async function generate() {
     setShowPreview(false);
     setPreviewUrl("");
     setOutputs([]);
+    setRenderJobId(null);
+    setRenderProgress({ pct: 0, stage: "", message: "" });
+    setDisplayProgressPct(0);
+    setRenderProjectDir("");
+    setRenderOutputsDir("");
 
-    if (shots.length < 3 || !shots[0]?.image || !shots[1]?.image || !shots[2]?.image) {
-      setStatus("Add and upload at least 3 shots (1, 2, 3) with images.");
+    if (!shots.some((s) => !!s.image)) {
+      setStatus("Upload at least one shot image.");
       return;
     }
     if (inputMode === "script") {
@@ -723,11 +951,12 @@ export default function App() {
         fdAudio.append("use_native_audio", useNativeAudio ? "true" : "false");
 
         const shotByTag = new Map(shots.map((s) => [normTag(s.tag), s]));
+        const activeAudioLines = audioLines.filter((l) => !!l.file);
 
         // For STS, voice selection is driven by voices_json. Keep speakers_json for compatibility.
-        const speakers = audioLines.map(() => "A");
-        const visualTags = audioLines.map((l) => normTag(l.shot_tag));
-        const voicesByLine = audioLines.map((l) => {
+        const speakers = activeAudioLines.map(() => "A");
+        const visualTags = activeAudioLines.map((l) => normTag(l.shot_tag));
+        const voicesByLine = activeAudioLines.map((l) => {
           const t = normTag(l.shot_tag);
           const s = shotByTag.get(t);
           return s?.voice_id || "";
@@ -737,8 +966,8 @@ export default function App() {
         fdAudio.append("visual_tags_json", JSON.stringify(visualTags));
         fdAudio.append("voices_json", JSON.stringify(voicesByLine));
 
-        audioLines.forEach((l) => {
-          fdAudio.append("audios", l.file);
+        activeAudioLines.forEach((l) => {
+          if (l.file) fdAudio.append("audios", l.file);
         });
 
         const stsRes = await apiFetch(`${API}/api/sts`, {
@@ -755,12 +984,17 @@ export default function App() {
         const stsData = await stsRes.json();
         projectDir = stsData.project_dir;
       }
+      setRenderProjectDir(projectDir);
+      setRenderOutputsDir(outputFolderForProject(projectDir));
 
       setStatus(inputMode === "script" ? "Step 2/4: Uploading images..." : "Step 2/3: Uploading images...");
 
-      const wsFile = shots[0]?.image || null;
-      const cuAFile = shots[1]?.image || null;
-      const cuBFile = shots[2]?.image || null;
+      // Legacy upload_inputs requires ws/cu_a/cu_b even though rendering now uses tagged visuals.
+      // Support 1..N shots by falling back to the first uploaded shot when slots are missing.
+      const fallbackShotImage = uploadedShots[0]?.image || null;
+      const wsFile = shots[0]?.image || fallbackShotImage;
+      const cuAFile = shots[1]?.image || fallbackShotImage;
+      const cuBFile = shots[2]?.image || fallbackShotImage;
       
       const maskFileRaw = shots[0]?.mask || null;
       const maskFile =
@@ -902,28 +1136,70 @@ export default function App() {
         setStatus(`Step 3/3: Rendering ${rlab2} clips...`);
       }
 
-      const renderRes = await apiFetch(`${API}/api/render`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          project_dir: projectDir,
-          renderer: effectiveRenderer,
-          ltx_prompt:
-            effectiveRenderer === "ltx" || effectiveRenderer === "infinitalk" ? ltxPrompt : "",
-        }),
-      });
+      const apiBases = API_FALLBACK ? [API, API_FALLBACK] : [API];
+      let jobBase = "";
+      let renderJobData = null;
+      for (const base of apiBases) {
+        try {
+          const renderJobRes = await apiFetch(`${base}/api/render_job`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              project_dir: projectDir,
+              renderer: effectiveRenderer,
+              renderer_prompt:
+                effectiveRenderer === "ltx" || effectiveRenderer === "infinitalk" ? ltxPrompt : "",
+            }),
+          });
+          if (!renderJobRes.ok) continue;
+          renderJobData = await renderJobRes.json();
+          jobBase = base;
+          break;
+        } catch {
+          // try next base
+        }
+      }
 
-      if (!renderRes.ok) {
-        const t = await renderRes.text();
-        setStatus(`Render error: ${t}`);
+      if (!renderJobData || !jobBase) {
+        setStatus("Render error: cannot reach backend for render_job.");
         return;
       }
 
-      const renderData = await renderRes.json();
+      const jobId = renderJobData.job_id;
+      setRenderJobId(jobId);
+
+      let renderData = null;
+      while (true) {
+        const sRes = await apiFetch(`${jobBase}/api/job_status?job_id=${encodeURIComponent(jobId)}`);
+        if (!sRes.ok) {
+          const t = await sRes.text();
+          setStatus(`Render job status error: ${t}`);
+          return;
+        }
+        const s = await sRes.json();
+        setRenderProgress({
+          pct: typeof s.pct === "number" ? s.pct : 0,
+          stage: s.stage || "",
+          message: s.message || "",
+        });
+
+        if (s.done) {
+          if (s.error) {
+            setStatus(`Render error: ${s.error}`);
+            return;
+          }
+          renderData = s;
+          break;
+        }
+
+        setStatus(`Rendering... [${s.stage || "render"}]${s.message ? ` ${s.message}` : ""}`);
+        await new Promise((r) => setTimeout(r, 750));
+      }
 
       const outDir = renderData.outputs_dir;
       const files = renderData.outputs || [];
       const prev = renderData.preview || "";
+      setRenderOutputsDir(outDir || "");
 
       const toUrl = (name) => {
         const parts = (outDir || "").replaceAll("\\\\", "/").split("/");
@@ -962,6 +1238,8 @@ export default function App() {
     };
   }, []);
 
+  const progressDone = clampProgress(renderProgress.pct) >= 100 || clampProgress(displayProgressPct) >= 100;
+
   return (
     <div
       style={{
@@ -983,7 +1261,7 @@ export default function App() {
         }}
       >
       <div style={{ display: "flex", alignItems: "baseline", gap: 16, flexWrap: "wrap" }}>
-        <h1 style={{ fontSize: 44, letterSpacing: 1.5, margin: 0, fontWeight: 950 }}>Episode Builder</h1>
+        <h1 style={{ fontSize: 44, letterSpacing: 1.5, margin: 0, fontWeight: 950, color: "#ffd36a" }}>Episode Builder</h1>
       </div>
 
       <div
@@ -996,96 +1274,169 @@ export default function App() {
           maxWidth: 720,
         }}
       >
-        <div style={{ fontWeight: 900, fontSize: 15, marginBottom: 8 }}>Your API keys (BYOK)</div>
-        <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 12, lineHeight: 1.45 }}>
-          Keys stay in this browser (localStorage) and are sent to your backend over HTTPS only. For local dev,
-          the backend can use <code style={{ opacity: 0.9 }}>backend/.env</code> instead.
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+          <div style={{ fontWeight: 900, fontSize: 15 }}>Your API keys (BYOK)</div>
+          <button
+            type="button"
+            onClick={() => setShowApiKeys((v) => !v)}
+            style={{
+              padding: "4px 8px",
+              borderRadius: 8,
+              border: "1px solid rgba(255,255,255,0.16)",
+              background: "rgba(255,255,255,0.05)",
+              color: "#eaeaea",
+              cursor: "pointer",
+              fontWeight: 900,
+              minWidth: 30,
+            }}
+            title={showApiKeys ? "Collapse API keys" : "Expand API keys"}
+            aria-label={showApiKeys ? "Collapse API keys" : "Expand API keys"}
+          >
+            {showApiKeys ? "▾" : "▸"}
+          </button>
         </div>
-        <div style={{ display: "grid", gap: 10 }}>
-          <label style={{ display: "grid", gap: 4, fontSize: 12 }}>
-            <span style={{ opacity: 0.8 }}>ElevenLabs API key</span>
-            <input
-              type="password"
-              autoComplete="off"
-              value={elevenDraft}
-              onChange={(e) => setElevenDraft(e.target.value)}
-              placeholder="xi-api-key…"
-              style={{
-                padding: 10,
-                borderRadius: 8,
-                border: "1px solid rgba(255,255,255,0.14)",
-                background: "rgba(0,0,0,0.25)",
-                color: "#eaeaea",
-              }}
-            />
-          </label>
-          <label style={{ display: "grid", gap: 4, fontSize: 12 }}>
-            <span style={{ opacity: 0.8 }}>FAL key (Fabric / LTX)</span>
-            <input
-              type="password"
-              autoComplete="off"
-              value={falDraft}
-              onChange={(e) => setFalDraft(e.target.value)}
-              placeholder="FAL_KEY…"
-              style={{
-                padding: 10,
-                borderRadius: 8,
-                border: "1px solid rgba(255,255,255,0.14)",
-                background: "rgba(0,0,0,0.25)",
-                color: "#eaeaea",
-              }}
-            />
-          </label>
-          <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-            <button
-              type="button"
-              onClick={() => {
-                try {
-                  localStorage.setItem(LS_ELEVEN, elevenDraft.trim());
-                  localStorage.setItem(LS_FAL, falDraft.trim());
-                } catch {}
-                setByokRefresh((n) => n + 1);
-              }}
-              style={{
-                padding: "8px 14px",
-                borderRadius: 10,
-                border: "1px solid rgba(255,255,255,0.18)",
-                background: "rgba(255,255,255,0.1)",
-                color: "#eaeaea",
-                cursor: "pointer",
-                fontWeight: 800,
-              }}
-            >
-              Save keys & reload voices
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                try {
-                  localStorage.removeItem(LS_ELEVEN);
-                  localStorage.removeItem(LS_FAL);
-                } catch {}
-                setElevenDraft("");
-                setFalDraft("");
-                setByokRefresh((n) => n + 1);
-              }}
-              style={{
-                padding: "8px 14px",
-                borderRadius: 10,
-                border: "1px solid rgba(255,255,255,0.12)",
-                background: "transparent",
-                color: "#eaeaea",
-                cursor: "pointer",
-                fontWeight: 700,
-                opacity: 0.85,
-              }}
-            >
-              Clear
-            </button>
-          </div>
-        </div>
+        {showApiKeys ? (
+          <>
+            <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 12, lineHeight: 1.45, marginTop: 8 }}>
+              Keys stay in this browser (localStorage) and are sent to your backend over HTTPS only. For local dev,
+              the backend can use <code style={{ opacity: 0.9 }}>backend/.env</code> instead.
+            </div>
+            <div style={{ display: "grid", gap: 10 }}>
+              <label style={{ display: "grid", gap: 4, fontSize: 12 }}>
+                <span style={{ opacity: 0.8 }}>ElevenLabs API key</span>
+                <input
+                  type="password"
+                  autoComplete="off"
+                  value={elevenDraft}
+                  onChange={(e) => setElevenDraft(e.target.value)}
+                  placeholder="xi-api-key…"
+                  style={{
+                    padding: 10,
+                    borderRadius: 8,
+                    border: "1px solid rgba(255,255,255,0.14)",
+                    background: "rgba(0,0,0,0.25)",
+                    color: "#eaeaea",
+                  }}
+                />
+              </label>
+              <label style={{ display: "grid", gap: 4, fontSize: 12 }}>
+                <span style={{ opacity: 0.8 }}>FAL key (Fabric / LTX)</span>
+                <input
+                  type="password"
+                  autoComplete="off"
+                  value={falDraft}
+                  onChange={(e) => setFalDraft(e.target.value)}
+                  placeholder="FAL_KEY…"
+                  style={{
+                    padding: 10,
+                    borderRadius: 8,
+                    border: "1px solid rgba(255,255,255,0.14)",
+                    background: "rgba(0,0,0,0.25)",
+                    color: "#eaeaea",
+                  }}
+                />
+              </label>
+              <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    try {
+                      localStorage.setItem(LS_ELEVEN, elevenDraft.trim());
+                      localStorage.setItem(LS_FAL, falDraft.trim());
+                    } catch {}
+                    setByokRefresh((n) => n + 1);
+                  }}
+                  style={{
+                    padding: "8px 14px",
+                    borderRadius: 10,
+                    border: "1px solid rgba(255,255,255,0.18)",
+                    background: "rgba(255,255,255,0.1)",
+                    color: "#eaeaea",
+                    cursor: "pointer",
+                    fontWeight: 800,
+                  }}
+                >
+                  Save keys & reload voices
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    try {
+                      localStorage.removeItem(LS_ELEVEN);
+                      localStorage.removeItem(LS_FAL);
+                    } catch {}
+                    setElevenDraft("");
+                    setFalDraft("");
+                    setByokRefresh((n) => n + 1);
+                  }}
+                  style={{
+                    padding: "8px 14px",
+                    borderRadius: 10,
+                    border: "1px solid rgba(255,255,255,0.12)",
+                    background: "transparent",
+                    color: "#eaeaea",
+                    cursor: "pointer",
+                    fontWeight: 700,
+                    opacity: 0.85,
+                  }}
+                >
+                  Clear
+                </button>
+              </div>
+            </div>
+          </>
+        ) : null}
       </div>
 
+      <div style={{ marginTop: 12, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+        <button
+          type="button"
+          onClick={saveProjectFile}
+          disabled={busy}
+          style={{
+            padding: "10px 14px",
+            borderRadius: 10,
+            border: "1px solid rgba(255,255,255,0.16)",
+            background: "rgba(255,255,255,0.06)",
+            color: "#eaeaea",
+            cursor: busy ? "not-allowed" : "pointer",
+            fontWeight: 850,
+            opacity: busy ? 0.5 : 1,
+          }}
+        >
+          Save project
+        </button>
+        <button
+          type="button"
+          onClick={() => projectFileInputRef.current?.click()}
+          disabled={busy}
+          style={{
+            padding: "10px 14px",
+            borderRadius: 10,
+            border: "1px solid rgba(255,255,255,0.16)",
+            background: "rgba(255,255,255,0.06)",
+            color: "#eaeaea",
+            cursor: busy ? "not-allowed" : "pointer",
+            fontWeight: 850,
+            opacity: busy ? 0.5 : 1,
+          }}
+        >
+          Open project
+        </button>
+        <input
+          ref={projectFileInputRef}
+          type="file"
+          accept=".json,.lipsync-project.json,application/json"
+          style={{ display: "none" }}
+          onChange={(e) => {
+            const file = e.target.files?.[0] || null;
+            e.target.value = "";
+            openProjectFile(file);
+          }}
+        />
+      </div>
+
+      <hr style={{ marginTop: 18, borderColor: "rgba(255, 211, 106, 0.45)" }} />
       <div
         style={{
           display: "flex",
@@ -1097,7 +1448,7 @@ export default function App() {
         }}
       >
         <div>
-          <div style={{ fontWeight: 900, fontSize: 18 }}>Shots</div>
+          <div style={{ fontWeight: 900, fontSize: 18, color: "#ffd36a" }}>Frames</div>
           <div style={{ fontSize: 12, opacity: 0.65, marginTop: 4 }}>
             Upload shots 1, 2, 3... Assign a voice per shot (unlimited).
           </div>
@@ -1316,8 +1667,8 @@ export default function App() {
         >
           <strong>Production build has no API URL.</strong> In Vercel → Settings → Environment Variables, add{" "}
           <code style={{ opacity: 0.95 }}>VITE_API_URL</code> = your Render URL (https, no trailing slash), then{" "}
-          <strong>Redeploy</strong>. Until then this app calls <code>http://127.0.0.1:8000</code>, which only works
-          on your own machine.
+          <strong>Redeploy</strong>. Without <code>VITE_API_URL</code>, the build falls back to{" "}
+          <code>http://localhost:8001</code>, which only works on your own machine.
         </div>
       ) : null}
 
@@ -1333,7 +1684,9 @@ export default function App() {
 
       {voicesStatus && <div style={{ marginTop: 8, opacity: 0.75, fontSize: 13 }}>{voicesStatus}</div>}
 
-      <div style={{ marginTop: 20, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+      <hr style={{ marginTop: 20, borderColor: "rgba(255, 211, 106, 0.45)" }} />
+      <div style={{ marginTop: 10, fontWeight: 900, fontSize: 18, color: "#ffd36a" }}>Shots</div>
+      <div style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
         <div style={{ fontWeight: 900, fontSize: 18 }}>Input</div>
         <div
           style={{
@@ -1441,7 +1794,7 @@ export default function App() {
           ) : (
             <>
               <span style={{ fontWeight: 900, color: "#7ec8e3" }}>Infinitalk:</span> fal{" "}
-              <code style={{ fontSize: 11, opacity: 0.85 }}>video-to-video</code> — a short reference
+              <code style={{ fontSize: 11, opacity: 0.85 }}>video-to-video</code> - a short reference
               clip is built from each line&apos;s still + WAV, then lip-synced.
             </>
           )}
@@ -1940,8 +2293,69 @@ export default function App() {
         >
           {busy ? "Working..." : inputMode === "script" ? "Generate Video" : "Convert + Generate"}
         </button>
+        <button
+          type="button"
+          onClick={async () => {
+            try {
+              const r = await apiFetch(`${API}/api/open_project_folder`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ project_dir: renderOutputsDir || renderProjectDir || "" }),
+              });
+              if (!r.ok) {
+                const t = await r.text();
+                setStatus(`Open folder error: ${t}`);
+              }
+            } catch {
+              setStatus("Open folder error: could not reach backend.");
+            }
+          }}
+          style={{
+            padding: "10px 14px",
+            borderRadius: 12,
+            border: "1px solid rgba(255,255,255,0.14)",
+            background: "rgba(255,255,255,0.05)",
+            color: "#eaeaea",
+            cursor: "pointer",
+            fontWeight: 800,
+          }}
+        >
+          Open renders folder
+        </button>
 
         <div style={{ opacity: 0.85, fontSize: 14 }}>{status}</div>
+        {renderJobId ? (
+          <div style={{ flexBasis: "100%", width: "100%", marginTop: 10 }}>
+            <div
+              style={{
+                height: 10,
+                borderRadius: 999,
+                background: "rgba(255,255,255,0.10)",
+                overflow: "hidden",
+                border: "1px solid rgba(255,255,255,0.10)",
+                position: "relative",
+              }}
+            >
+              <div
+                style={{
+                  height: "100%",
+                  width: `${clampProgress(displayProgressPct)}%`,
+                  background: progressDone
+                    ? "rgba(122,255,231,0.88)"
+                    : "linear-gradient(90deg, rgba(122,255,231,0.90), rgba(154,209,255,0.92), rgba(255,238,166,0.88))",
+                  backgroundSize: progressDone ? "100% 100%" : "220% 100%",
+                  animation: progressDone ? "none" : "lipsync-progress-flow 1.4s linear infinite",
+                  transition: "width 420ms ease",
+                  boxShadow: progressDone ? "none" : "0 0 16px rgba(122,255,231,0.20)",
+                }}
+              />
+            </div>
+            <div style={{ marginTop: 6, fontSize: 12, opacity: 0.75 }}>
+              {renderProgress.stage || "render"} - {Math.round(clampProgress(displayProgressPct))}%
+              {renderProgress.message ? ` (${renderProgress.message})` : ""}
+            </div>
+          </div>
+        ) : null}
       </div>
 
       {(previewUrl || outputs.length > 0) && (

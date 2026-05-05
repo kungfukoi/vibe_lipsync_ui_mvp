@@ -4,11 +4,12 @@
   "scripts": {
     "setup": "pip install -r backend/requirements.txt && npm install && npm install --prefix ui",
     "dev": "concurrently -k -n backend,ui -c cyan,magenta \"npm run dev:backend:8001\" \"npm run dev:ui:8001\"",
-    "dev:8000": "concurrently -k -n backend,ui -c cyan,magenta \"npm run dev:backend\" \"npm run dev:ui\"",
+    "dev:8000": "concurrently -k -n backend,ui -c cyan,magenta \"npm run dev:backend\" \"npm run dev:ui:8000\"",
     "dev:8001": "npm run dev",
     "dev:backend": "cd backend && python -m uvicorn app:app --reload --port 8000",
     "dev:backend:8001": "cd backend && python -m uvicorn app:app --reload --port 8001",
     "dev:ui": "cd ui && npm run dev",
+    "dev:ui:8000": "cd ui && cross-env VITE_API_URL=http://127.0.0.1:8000 npm run dev",
     "dev:ui:8001": "cd ui && cross-env VITE_API_URL=http://127.0.0.1:8001 npm run dev"
   },
   "devDependencies": {
